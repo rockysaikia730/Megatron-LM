@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain GPT."""
 
+import math
 import os
 import torch
 from functools import partial
@@ -211,7 +212,35 @@ def get_batch(data_iterator):
 SPIKY_LOSS_PERC = 0.2
 
 
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, labels: torch.Tensor = None, assistant_mask: torch.Tensor = None):
+def get_current_image_weight(args):
+    """Compute image weight for the current training step.
+
+    Returns a static weight when --image-weight-decay is not enabled,
+    otherwise computes a logistic decay from image_weight_max to image_weight_min.
+    """
+    if not args.image_weight_decay:
+        return args.image_weight
+
+    step = getattr(args, 'curr_iteration', 0)
+    max_w = args.image_weight_max
+    min_w = args.image_weight_min
+    start_step = args.image_weight_decay_start_step
+    end_step = args.image_weight_decay_end_step
+    k = args.image_weight_decay_steepness
+
+    if step <= start_step:
+        return max_w
+    if step >= end_step:
+        return min_w
+
+    # Normalize step within [start_step, end_step] to [0, 1]
+    t = (step - start_step) / (end_step - start_step)
+    # Logistic sigmoid centered at t=0.5, maps [0,1] → [max_w, min_w]
+    sigmoid = 1.0 / (1.0 + math.exp(k * (t - 0.5)))
+    return min_w + (max_w - min_w) * sigmoid
+
+
+def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, labels: torch.Tensor = None, assistant_mask: torch.Tensor = None, current_image_weight: float = None):
     """Loss function.
 
     Args:
@@ -317,6 +346,9 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, labels: torc
             torch.distributed.all_reduce(reporting_assistant_loss, group=mpu.get_data_parallel_group())
             stats_dict['assistant_loss'] = (reporting_assistant_loss[0], reporting_assistant_loss[1])
 
+    if args.log_image_weight and current_image_weight is not None:
+        stats_dict['image-weight'] = current_image_weight
+
     return (
         loss[0] * args.context_parallel_size,
         local_num_tokens,
@@ -368,11 +400,22 @@ def forward_step(data_iterator, model: GPTModel):
             )
     timers('batch-generator').stop()
 
+    # Apply dynamic image weight decay (overrides static weight set in dataset)
+    current_image_weight = get_current_image_weight(args)
+    if args.image_weight_decay or current_image_weight != 1.0:
+        if labels is not None and hasattr(args, 'vision_token_offset'):
+            image_mask = (labels >= args.vision_token_offset) & (
+                labels <= args.vision_token_offset + args.vision_vocab_size
+            )
+            loss_mask[image_mask] = current_image_weight
+
     with stimer:
         output_tensor = model(tokens, position_ids, attention_mask,
                               labels=labels, packed_seq_params=packed_seq_params)
 
-    return output_tensor, partial(loss_func, loss_mask, labels=labels, assistant_mask=assistant_mask)
+    return output_tensor, partial(loss_func, loss_mask, labels=labels,
+                                  assistant_mask=assistant_mask,
+                                  current_image_weight=current_image_weight)
 
 
 def is_dataset_built_on_rank():

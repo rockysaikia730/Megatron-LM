@@ -840,6 +840,21 @@ def validate_args(args, defaults={}):
         if args.rank == 0:
             print("WARNING: When using nsys profiling, the job will terminate upon receiving the SIGUSR2 signal. Disabling --exit-signal-handler`")
 
+    # Image weight decay
+    if args.image_weight_decay:
+        if args.image_weight_max is None:
+            args.image_weight_max = args.image_weight
+        assert args.image_weight_max >= args.image_weight_min, \
+            f"--image-weight-max ({args.image_weight_max}) must be >= --image-weight-min ({args.image_weight_min})"
+        # Resolve fraction-based start/end to absolute steps
+        if args.image_weight_decay_start_step is None:
+            args.image_weight_decay_start_step = int(args.image_weight_decay_start * args.train_iters)
+        if args.image_weight_decay_end_step is None:
+            args.image_weight_decay_end_step = int(args.image_weight_decay_end * args.train_iters)
+        assert args.image_weight_decay_start_step < args.image_weight_decay_end_step, \
+            (f"--image-weight-decay-start-step ({args.image_weight_decay_start_step}) must be < "
+             f"--image-weight-decay-end-step ({args.image_weight_decay_end_step})")
+
     # Goldfish loss
     if args.goldfish_loss:
         assert args.goldfish_k > 0, f"goldfish_k (frequency) must be a positive integer. ({args.goldfish_k})"
@@ -2125,6 +2140,24 @@ def _add_data_args(parser):
     group.add_argument('--image-weight', type=float, default=1.0,
                        help='Loss mask weight for image tokens between <|img_start|> and <|img_end|>. '
                             'Default 1.0 (normal loss). Set to 0.0 to fully mask image tokens.')
+    group.add_argument('--image-weight-decay', action='store_true', default=False,
+                       help='Enable logistic decay schedule for image weight.')
+    group.add_argument('--image-weight-max', type=float, default=None,
+                       help='Image weight at start of decay. Defaults to --image-weight if not set.')
+    group.add_argument('--image-weight-min', type=float, default=0.0,
+                       help='Image weight at end of decay.')
+    group.add_argument('--image-weight-decay-start', type=float, default=0.0,
+                       help='Start of decay as fraction of train_iters (0.0-1.0).')
+    group.add_argument('--image-weight-decay-end', type=float, default=1.0,
+                       help='End of decay as fraction of train_iters (0.0-1.0).')
+    group.add_argument('--image-weight-decay-start-step', type=int, default=None,
+                       help='Start of decay as absolute step number (overrides --image-weight-decay-start).')
+    group.add_argument('--image-weight-decay-end-step', type=int, default=None,
+                       help='End of decay as absolute step number (overrides --image-weight-decay-end).')
+    group.add_argument('--image-weight-decay-steepness', type=float, default=10.0,
+                       help='Steepness k of the logistic decay curve.')
+    group.add_argument('--log-image-weight', action='store_true', default=False,
+                       help='Log current image weight to tensorboard/wandb each step.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')

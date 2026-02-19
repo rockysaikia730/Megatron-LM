@@ -77,6 +77,16 @@ def get_args():
         action="store_true",
         help="Whether the dataset is multimodal",
     )
+    parser.add_argument(
+        "--unordered",
+        action="store_true",
+        help=(
+            "Use imap_unordered instead of imap for multiprocessing. "
+            "Improves throughput when document sizes vary, but output document "
+            "order will differ from the input. Safe for pre-training/SFT datasets "
+            "that are shuffled during training."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -216,7 +226,8 @@ def main():
             initializer=_worker_init,
             initargs=(args.input, args.source_tokenizer, args.target_tokenizer, args.multimodal),
         )
-        doc_iter = pool.imap(_retokenize_document, range(num_docs))
+        imap_fn = pool.imap_unordered if args.unordered else pool.imap
+        doc_iter = imap_fn(_retokenize_document, range(num_docs))
     else:
         _worker_init(args.input, args.source_tokenizer, args.target_tokenizer, args.multimodal)
         doc_iter = map(_retokenize_document, range(num_docs))

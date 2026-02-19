@@ -216,7 +216,8 @@ def get_current_image_weight(args):
     """Compute image weight for the current training step.
 
     Returns a static weight when --image-weight-decay is not enabled,
-    otherwise computes a logistic decay from image_weight_max to image_weight_min.
+    otherwise computes a decay from image_weight_max to image_weight_min
+    using the selected schedule (logistic, cosine, or linear).
     """
     if not args.image_weight_decay:
         return args.image_weight
@@ -226,7 +227,7 @@ def get_current_image_weight(args):
     min_w = args.image_weight_min
     start_step = args.image_weight_decay_start_step
     end_step = args.image_weight_decay_end_step
-    k = args.image_weight_decay_steepness
+    schedule = args.image_weight_decay_schedule
 
     if step <= start_step:
         return max_w
@@ -235,9 +236,14 @@ def get_current_image_weight(args):
 
     # Normalize step within [start_step, end_step] to [0, 1]
     t = (step - start_step) / (end_step - start_step)
-    # Logistic sigmoid centered at t=0.5, maps [0,1] → [max_w, min_w]
-    sigmoid = 1.0 / (1.0 + math.exp(k * (t - 0.5)))
-    return min_w + (max_w - min_w) * sigmoid
+
+    if schedule == 'cosine':
+        cosine_decay = 0.5 * (1 + math.cos(t * math.pi))
+        return min_w + (max_w - min_w) * cosine_decay
+    elif schedule == 'linear':
+        return max_w - (max_w - min_w) * t
+    else:
+        raise ValueError(f"Unknown image weight decay schedule: {schedule}")
 
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, labels: torch.Tensor = None, assistant_mask: torch.Tensor = None, current_image_weight: float = None):

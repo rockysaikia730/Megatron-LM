@@ -2154,8 +2154,9 @@ def _add_data_args(parser):
                        help='Start of decay as absolute step number (overrides --image-weight-decay-start).')
     group.add_argument('--image-weight-decay-end-step', type=int, default=None,
                        help='End of decay as absolute step number (overrides --image-weight-decay-end).')
-    group.add_argument('--image-weight-decay-steepness', type=float, default=10.0,
-                       help='Steepness k of the logistic decay curve.')
+    group.add_argument('--image-weight-decay-schedule', type=str, default='cosine',
+                       choices=['cosine', 'linear'],
+                       help='Decay schedule type for image weight. Default: cosine.')
     group.add_argument('--log-image-weight', action='store_true', default=False,
                        help='Log current image weight to tensorboard/wandb each step.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',

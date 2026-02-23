@@ -190,7 +190,8 @@ def main():
             part_seq_pointers[0] = 0
 
         # Adjust document indices relative to seq_start
-        part_doc_indices = doc_indices[start_doc:end_doc] - seq_start
+        # Include end_doc+1 to capture the sentinel entry (doc_indices always has num_docs+1 entries)
+        part_doc_indices = doc_indices[start_doc:end_doc + 1] - seq_start
 
         # Slice sequence modes if multimodal
         part_seq_modes = None
@@ -220,7 +221,7 @@ def main():
         )
 
         print(f"\n  Part {part_idx}: {part_prefix}")
-        print(f"    Documents: {num_part_docs}")
+        print(f"    Documents: {len(part_doc_indices)}")
         print(f"    Sequences: {num_seqs}")
         print(f"    Bytes copied: {byte_end - byte_start:,}")
 

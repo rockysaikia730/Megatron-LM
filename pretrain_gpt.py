@@ -352,7 +352,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, labels: torc
             torch.distributed.all_reduce(reporting_assistant_loss, group=mpu.get_data_parallel_group())
             stats_dict['assistant_loss'] = (reporting_assistant_loss[0], reporting_assistant_loss[1])
 
-    if args.log_image_weight and current_image_weight is not None:
+    if args.log_image_weight:
         stats_dict['image-weight'] = current_image_weight
 
     return (
@@ -408,10 +408,10 @@ def forward_step(data_iterator, model: GPTModel):
 
     # Apply dynamic image weight decay (overrides static weight set in dataset)
     current_image_weight = get_current_image_weight(args)
-    if args.image_weight_decay or current_image_weight != 1.0:
+    if args.image_weight_decay:
         if labels is not None and hasattr(args, 'vision_token_offset'):
             image_mask = (labels >= args.vision_token_offset) & (
-                labels <= args.vision_token_offset + args.vision_vocab_size
+                labels < args.vision_token_offset + args.vision_vocab_size
             )
             loss_mask[image_mask] = current_image_weight
 

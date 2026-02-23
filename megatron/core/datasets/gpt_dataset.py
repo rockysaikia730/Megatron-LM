@@ -287,7 +287,7 @@ class GPTDataset(MegatronDataset):
 
         # Image token loss masking
         if self._image_weight != 1.0 and self._first_vision_token_id is not None:
-            image_mask = (labels >= self._first_vision_token_id) & (labels <= self._last_vision_token_id)
+            image_mask = (labels >= self._first_vision_token_id) & (labels < self._last_vision_token_id)
             loss_mask[image_mask] = self._image_weight
 
         # Batch padding sequence so we mask the loss

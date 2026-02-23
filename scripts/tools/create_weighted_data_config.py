@@ -31,12 +31,13 @@ def get_dataset_size(prefix: str) -> int:
     if not os.path.isfile(idx_file):
         raise FileNotFoundError(f"Index file not found: {idx_file}")
 
-    # Read the number of documents from .idx file (at byte offset 9, uint64 little-endian)
+    # .idx layout: 9B header, 8B version, 1B dtype, 8B sequence_count, 8B document_count
     with open(idx_file, 'rb') as f:
-        f.seek(9)
-        num_docs = struct.unpack('<Q', f.read(8))[0]
+        f.seek(18)  # skip header(9) + version(8) + dtype(1)
+        num_sequences = struct.unpack('<Q', f.read(8))[0]
+        #num_docs = struct.unpack('<Q', f.read(8))[0]
 
-    return num_docs
+    return num_sequences
 
 
 def create_data_prefix(list_of_paths: List[str]) -> List[str]:

@@ -362,7 +362,7 @@ def save_checkpoint(queue: mp.Queue, args):
         # Make space so we can load the model properly now.
         del state_dict
         gc.collect()
-        print(f"Loading the converted pytorch checkpoint in a Llama HF model from {tmp_save_dir}")
+        print(f"Loading the converted pytorch checkpoint in an Apertus HF model from {tmp_save_dir}")
         model = ApertusForCausalLM.from_pretrained(
             str(tmp_save_dir), torch_dtype=torch.bfloat16, low_cpu_mem_usage=False # last arg requires a recent version of accelerate
         )

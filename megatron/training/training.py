@@ -20,6 +20,7 @@ import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from .log_handler import CustomHandler
+from .theoretical_memory_usage import report_theoretical_memory
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
@@ -654,6 +655,10 @@ def pretrain(
         args = get_args()
         timers = get_timers()
 
+        if torch.distributed.get_rank() == 0:
+            print(f"num_microbatches is {get_num_microbatches()}")
+            report_theoretical_memory(args, get_num_microbatches())
+
         if args.log_progress:
             append_to_progress_log("Starting job")
 
@@ -1253,6 +1258,9 @@ def setup_model_and_optimizer(
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
+    if torch.distributed.get_rank() == 0:
+        print(model)
+
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     if args.skip_train:
         optimizer, opt_param_scheduler = None, None
@@ -1342,6 +1350,7 @@ def setup_model_and_optimizer(
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
+        args.tokens_so_far = 0
 
     # get model without FP16 and/or DDP wrappers
     if (
@@ -1769,6 +1778,9 @@ def training_log(
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
 
+        # Calculate MFU: 990 TFLOPs for GH200
+        mfu = throughput / (990) * 100
+
         # Calculate tokens per second
         tokens_per_iteration = args.global_batch_size * args.seq_length
         tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
@@ -1810,6 +1822,7 @@ def training_log(
         log_string += f" tokens/sec/gpu: {tokens_per_sec_per_gpu:.1f} |"
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            log_string += f' MFU: {mfu:.2f}% |'
             if writer:
                 writer.add_scalar('throughput', throughput, iteration)
             if wandb_writer:

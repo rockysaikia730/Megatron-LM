@@ -539,10 +539,8 @@ def get_pg_size(group=None):
     Returns:
         int: World size (1 if distributed not initialized or group is None, else group.size())
     """
-    if group is None:
-        if not torch.distributed.is_initialized():
-            return 1
-        return torch.distributed.get_world_size()
+    if not torch.distributed.is_initialized() or group is None:
+        return 1
     return group.size()
 
 

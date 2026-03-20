@@ -1,5 +1,3 @@
-# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
-
 """Pretrain and SFT GPT."""
 
 import json
@@ -8,6 +6,7 @@ from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
@@ -40,81 +39,83 @@ except ImportError:
 
 stimer = StragglerDetector()
 
-
-def tokens_to_packed_seq_params(input_ids, eod_token, orig_seq_len, qkv_format='thd', cu_seqlens_padded=None):
+def _ensure_complete_batch_on_all_tp_ranks(batch, device):
     """
-    Compute PackedSeqParams from input tokens using EOD token boundaries.
+    Broadcast all batch fields from TP-rank-0 to sibling TP ranks.
 
-    Args:
-        input_ids: Input token IDs, shape assumed flattened (1, tokens) or (tokens)
-        eod_token: End-of-Document token ID (from tokenizer.eod)
-        orig_seq_len: Original sequence length for fixed boundaries
-        qkv_format: QKV format - 'sbhd' (default) or 'thd' (for CP with padding)
-        cu_seqlens_padded: Optional padded cumulative lengths for context parallelism
+    When PP > 1, get_batch_on_this_tp_rank will leave some fields as None on
+    non-zero TP ranks (e.g. tokens on the last PP stage). This function
+    ensures every TP rank has the full batch so they can all compute
+    packed_seq_params independently.
 
-    Returns:
-        PackedSeqParams with cu_seqlens respecting both EOD and orig_seq_len boundaries
+    Collective: all TP ranks must call. No-op when TP = 1.
+    """
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    if tp_size <= 1:
+        return
+
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    tp_src = dist.get_global_rank(tp_group, 0)
+
+    fields_and_dtypes = [
+        ("tokens", torch.long), ("labels", torch.long),
+        ("loss_mask", torch.float), ("position_ids", torch.long),
+    ]
+
+    # Step 1: broadcast shape from TP-rank-0 (which always has all fields).
+    shape_buf = torch.zeros(2, device=device, dtype=torch.int64)
+    if tp_rank == 0:
+        ref = next(v for v in [batch.get(k) for k, _ in fields_and_dtypes] if v is not None)
+        shape_buf[0] = ref.shape[0]
+        shape_buf[1] = ref.shape[1] if ref.dim() > 1 else 1
+    dist.broadcast(shape_buf, src=tp_src, group=tp_group)
+    shape = (int(shape_buf[0].item()), int(shape_buf[1].item()))
+
+    # Step 2: broadcast ALL fields unconditionally.  All TP ranks must
+    # participate in every broadcast (it's a collective).  Ranks that
+    # already have a field get it overwritten with the same data; ranks
+    # that had None receive it for the first time.
+    for key, dtype in fields_and_dtypes:
+        val = batch.get(key)
+        if val is None:
+            val = torch.empty(shape, device=device, dtype=dtype)
+        if not val.is_contiguous():
+            val = val.contiguous()
+        dist.broadcast(val, src=tp_src, group=tp_group)
+        batch[key] = val
+
+
+def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
+    """Compute PackedSeqParams from a local batch, applying CP padding if needed.
+
+    When CP > 1, this function modifies the batch in-place (padding tokens,
+    labels, loss_mask, position_ids to lengths divisible by 2*CP, then slicing
+    for DualChunkSwap).  This changes tensor sizes, which is why every TP rank
+    that participates in the forward pass must call this function independently.
+
+    Returns (packed_seq_params, modified_batch).
     """
     from megatron.core.packed_seq_params import PackedSeqParams
 
-    # Create boundaries at fixed intervals (based on orig_seq_len)
-    # Find EOD token positions (+1 to mark position AFTER eod)
-    # Concatenate and sort to get all boundaries (fixed + EOD)
-    cu_seq, _ = torch.sort(torch.cat((
-        torch.arange(0, input_ids.size(-1) + orig_seq_len, orig_seq_len, device=input_ids.device, dtype=torch.int32),
-        (input_ids.flatten() == eod_token).nonzero()[:, 0].int() + 1,
-    )))
+    qkv_format = 'thd'
+    tokens_full_flat = batch["tokens"].view(1, -1)
+    total_tokens = tokens_full_flat.size(-1)
 
-    # Compute max sequence length between boundaries
-    max_len = (cu_seq[1:] - cu_seq[:-1]).max()
-
-    return PackedSeqParams(
-        cu_seqlens_q=cu_seq,
-        cu_seqlens_kv=cu_seq,
-        max_seqlen_q=max_len,
-        max_seqlen_kv=max_len,
-        qkv_format=qkv_format,
-        cu_seqlens_q_padded=cu_seqlens_padded,
-        cu_seqlens_kv_padded=cu_seqlens_padded,
-    )
-
-
-
-def get_batch(data_iterator, vp_stage=None):
-    """Generate a batch with optional packed-sequence + context-parallelism support."""
-
-    if not is_first_or_last_pipeline_stage(vp_stage):
-        return (None, None, None, None, None), None
-
-    args = get_args()
-    batch = get_batch_on_this_tp_rank(data_iterator)
-
-    packed_seq_params = None
-
-    if args.use_packed_seq_params:
-        tokenizer = get_tokenizer()
-        qkv_format = 'thd'
-        cp_size = parallel_state.get_context_parallel_world_size()
-
-        tokens_full_flat = batch["tokens"].view(1, -1)
-        total_tokens = tokens_full_flat.size(-1)
-        device = tokens_full_flat.device
-
-        # Step 1a: compute cu_seqlens from EOD boundaries
-        eod_positions = (tokens_full_flat.flatten() == tokenizer.eod).nonzero()[:, 0].int() + 1
-        fixed_boundaries = torch.arange(
-            0, total_tokens + args.seq_length, args.seq_length,
-            device=device, dtype=torch.int32,
+    # Step 1a: compute cu_seqlens from EOD boundaries + fixed seq_length intervals
+    cu_seq, _ = torch.sort(torch.unique(torch.cat((
+        torch.arange(0, total_tokens + args.seq_length, args.seq_length, device=device, dtype=torch.int32), 
+        (tokens_full_flat.flatten() == tokenizer.eod).nonzero()[:, 0].int() + 1)))
         )
-        cu_seq, _ = torch.sort(torch.unique(torch.cat((fixed_boundaries, eod_positions))))
-        cu_seq = cu_seq[cu_seq <= total_tokens]
-        if cu_seq[-1] != total_tokens:
-            cu_seq = torch.cat([
-                cu_seq,
-                torch.tensor([total_tokens], device=device, dtype=cu_seq.dtype),
-            ])
 
-        # Step 1b: merge sequences that are too short for CP 
+    # Step 1b: merge sub-sequences that are too short for CP
+    if cp_size > 1:
+        from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
+            pad_thd_sequences_for_cp,
+            generate_positional_ids_for_cp,
+            get_batch_on_this_cp_rank as te_get_batch_on_this_cp_rank,
+        )
+
         _divisibility = 2 * cp_size
         _seq_lens = cu_seq[1:] - cu_seq[:-1]
         _keep = torch.cat([
@@ -123,130 +124,226 @@ def get_batch(data_iterator, vp_stage=None):
         ])
         cu_seq = cu_seq[_keep]
 
-        if cp_size > 1:
+        divisibility = 2 * cp_size
+        cp_group = parallel_state.get_context_parallel_group()
+        cp_rank = parallel_state.get_context_parallel_rank()
 
-            from megatron.core.packed_seq_params import PackedSeqParams
-            from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
-                pad_thd_sequences_for_cp,
-                generate_positional_ids_for_cp,
-                get_batch_on_this_cp_rank as te_get_batch_on_this_cp_rank,
+        # Step 2a. Pad every sub-sequence so its length is divisible by 2*cp_size
+        input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
+            batch["tokens"].view(-1).cpu(),
+            batch["labels"].view(-1).cpu(),
+            cu_seq.cpu(),
+            divisibility_factor=divisibility,
+            padding_token_id=tokenizer.eod,
+            padding_label_id=-100,
+        )
+        input_ids_padded = input_ids_padded.to(device)
+        labels_padded = labels_padded.to(device)
+        cu_seqlens_padded = cu_seqlens_padded.to(device=device, dtype=torch.int32)
+
+        assert (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]).min() % divisibility == 0, \
+            "Some padded sequence lengths are not divisible by 2*cp_size after merging."
+
+        # Step 2b. Pad loss_mask (no TE utility exists for this)
+        loss_mask_flat = batch["loss_mask"].view(-1)
+        seqlens = cu_seq[1:] - cu_seq[:-1]
+        padding_amounts = [
+            ((l.item() + divisibility - 1) // divisibility) * divisibility - l.item()
+            for l in seqlens
+        ]
+        loss_mask_seqs = [
+            loss_mask_flat[cu_seq[i]:cu_seq[i + 1]]
+            for i in range(len(cu_seq) - 1)
+        ]
+        loss_mask_padded = torch.cat([
+            torch.cat([seq, torch.zeros(pad, dtype=seq.dtype, device=seq.device)])
+            if pad > 0 else seq
+            for seq, pad in zip(loss_mask_seqs, padding_amounts)
+        ])
+
+        # Step 2c. Generate position_ids for padded sequences
+        position_ids_padded = generate_positional_ids_for_cp(
+            cu_seq.cpu(), divisibility, dtype=batch["position_ids"].dtype
+        ).to(device)
+
+        # Step 3a: DualChunkSwap slicing
+        input_ids_padded, labels_padded, position_ids_padded = (
+            te_get_batch_on_this_cp_rank(
+                cu_seqlens_padded,
+                input_ids_padded,
+                labels_padded,
+                position_ids_padded,
+                cp_group=cp_group,
+                qvk_format='thd',
             )
+        )
 
-            divisibility = 2 * cp_size
-            cp_group = parallel_state.get_context_parallel_group()
-            cp_rank = parallel_state.get_context_parallel_rank()
+        # Step 3b: select loss_mask slices for this CP rank
+        total_slices = 2 * cp_size
+        slice_sizes = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]) // total_slices
+        cp_rank_indices = []
+        for slice_size, seq_start in zip(slice_sizes, cu_seqlens_padded[:-1]):
+            cp_rank_indices.append(torch.arange(
+                seq_start + cp_rank * slice_size,
+                seq_start + (cp_rank + 1) * slice_size,
+                device=device,
+            ))
+            cp_rank_indices.append(torch.arange(
+                seq_start + (total_slices - cp_rank - 1) * slice_size,
+                seq_start + (total_slices - cp_rank) * slice_size,
+                device=device,
+            ))
+        loss_mask_padded = loss_mask_padded.index_select(0, torch.cat(cp_rank_indices))
 
-            # Step 2a. Pad every sub-sequence so its length is divisible by 2*cp_size
-            input_ids_padded, labels_padded, cu_seqlens_padded = pad_thd_sequences_for_cp(
-                batch["tokens"].view(-1).cpu(),
-                batch["labels"].view(-1).cpu(),
-                cu_seq.cpu(),
-                divisibility_factor=divisibility,
-                padding_token_id=tokenizer.eod,
-                padding_label_id=-100,
-            )
-            input_ids_padded = input_ids_padded.to(device)
-            labels_padded = labels_padded.to(device)
-            cu_seqlens_padded = cu_seqlens_padded.to(device=device, dtype=torch.int32)
+        batch["tokens"] = input_ids_padded.unsqueeze(0)
+        batch["labels"] = labels_padded.unsqueeze(0)
+        batch["loss_mask"] = loss_mask_padded.unsqueeze(0)
+        batch["position_ids"] = position_ids_padded.unsqueeze(0)
+        batch["attention_mask"] = None
 
-            assert (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]).min() % divisibility == 0, \
-                "Some padded sequence lengths are not divisible by 2*cp_size after merging."
+        max_padded_len = int((cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]).max().item())
+        assert max_padded_len % divisibility == 0, \
+            f"max_padded_len {max_padded_len} not divisible by {divisibility}"
 
-            # Step 2b. Pad loss_mask -> Unfortunately, there wasn't any function applying padding to the loss function in transformers_engine, 
-            # but the current line of code follow the same algorithm that the other implementations have.
-            loss_mask_flat = batch["loss_mask"].view(-1)
-            seqlens = cu_seq[1:] - cu_seq[:-1]
-            padding_amounts = [
-                ((l.item() + divisibility - 1) // divisibility) * divisibility - l.item()
-                for l in seqlens
-            ]
-            loss_mask_seqs = [
-                loss_mask_flat[cu_seq[i]:cu_seq[i + 1]]
-                for i in range(len(cu_seq) - 1)
-            ]
-            loss_mask_padded = torch.cat([
-                torch.cat([seq, torch.zeros(pad, dtype=seq.dtype, device=seq.device)])
-                if pad > 0 else seq
-                for seq, pad in zip(loss_mask_seqs, padding_amounts)
-            ])
-
-            # Step 2c. Generate position_ids for padded sequences
-            position_ids_padded = generate_positional_ids_for_cp(
-                cu_seq.cpu(), divisibility, dtype=batch["position_ids"].dtype
-            ).to(device)
-
-            # Step 3a: DualChunkSwap slicing
-            input_ids_padded, labels_padded, position_ids_padded = (
-                te_get_batch_on_this_cp_rank(
-                    cu_seqlens_padded,
-                    input_ids_padded,
-                    labels_padded,
-                    position_ids_padded,
-                    cp_group=cp_group,
-                    qvk_format='thd',
-                )
-            )
-
-            # Steo 3b: Again, similar to the transformer_engine logic, we select the loss_mask tensor related to the specific CP rank of this GPU.
-            total_slices = 2 * cp_size
-            slice_sizes = (
-                (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]) // total_slices
-            )
-            cp_rank_indices = []
-            
-            # On this particular rank, for each sequence, get two slices, one from the beginning
-            # and one from the end. 
-            for slice_size, seq_start in zip(slice_sizes, cu_seqlens_padded[:-1]):
-                cp_rank_indices.append(torch.arange(
-                    seq_start + cp_rank * slice_size,
-                    seq_start + (cp_rank + 1) * slice_size,
-                    device=device,
-                ))
-                cp_rank_indices.append(torch.arange(
-                    seq_start + (total_slices - cp_rank - 1) * slice_size,
-                    seq_start + (total_slices - cp_rank) * slice_size,
-                    device=device,
-                ))
-            loss_mask_padded = loss_mask_padded.index_select(
-                0, torch.cat(cp_rank_indices)
-            )
-
-            batch["tokens"] = input_ids_padded.unsqueeze(0)
-            batch["labels"] = labels_padded.unsqueeze(0)
-            batch["loss_mask"] = loss_mask_padded.unsqueeze(0)
-            batch["position_ids"] = position_ids_padded.unsqueeze(0)
-            batch["attention_mask"] = None
-
-            #  Step 4: construct PackedSeqParams 
-            max_padded_len = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]).max()
-
-            assert max_padded_len % divisibility == 0, \
-                f"max_padded_len {max_padded_len} not divisible by {divisibility}"
-
-            packed_seq_params = PackedSeqParams(
-                cu_seqlens_q=cu_seqlens_padded,  # We are returning input_ids_padded as "tokens", cu_seqlens is no longer necessary. This is a bit hacky.
-                cu_seqlens_kv=cu_seqlens_padded, # We are returning input_ids_padded as "tokens", cu_seqlens is no longer necessary. This is a bit hacky.
-                max_seqlen_q=max_padded_len,
-                max_seqlen_kv=max_padded_len,
-                qkv_format=qkv_format,
-                cu_seqlens_q_padded=cu_seqlens_padded,
-                cu_seqlens_kv_padded=cu_seqlens_padded,
-            )
-
-        else:
-            # cp_size == 1: No need to cut the sequence length
-            packed_seq_params = tokens_to_packed_seq_params(
-                tokens_full_flat,
-                eod_token=tokenizer.eod,
-                orig_seq_len=args.seq_length,
-                qkv_format=qkv_format,
-            )
-            for key in ["tokens", "labels", "loss_mask", "position_ids"]:
-                if batch.get(key) is not None:
-                    batch[key] = batch[key].view(1, -1)
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            max_seqlen_q=max_padded_len,
+            max_seqlen_kv=max_padded_len,
+            qkv_format=qkv_format,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+        )
 
     else:
+        # CP = 1: use the already-computed cu_seq, no padding needed.
+        max_len = (cu_seq[1:] - cu_seq[:-1]).max()
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seq,
+            cu_seqlens_kv=cu_seq,
+            max_seqlen_q=max_len,
+            max_seqlen_kv=max_len,
+            qkv_format=qkv_format,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_kv_padded=None,
+        )
+        for key in ["tokens", "labels", "loss_mask", "position_ids"]:
+            if batch.get(key) is not None:
+                batch[key] = batch[key].view(1, -1)
+
+    return packed_seq_params, batch
+
+
+def _compute_and_broadcast_packed_seq_params(batch, args, device):
+    """Compute packed_seq_params on TP-rank-0 and broadcast to sibling TP ranks.
+
+    Used for middle PP stages where only TP-rank-0 has meaningful batch data
+    and the batch itself is discarded (activations arrive via PP P2P).
+
+    Returns packed_seq_params on all TP ranks.
+    """
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    cp_size = parallel_state.get_context_parallel_world_size()
+    tokenizer = get_tokenizer()
+
+    # TP-rank-0 computes; others will receive via broadcast.
+    packed_seq_params = None
+    if tp_rank == 0:
+        packed_seq_params, _ = _packed_seq_params_from_batch(
+            batch, args, tokenizer, cp_size, device
+        )
+
+    # Broadcast packed_seq_params to other TP ranks.
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    if tp_size <= 1:
+        return packed_seq_params
+
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    tp_src_global = dist.get_global_rank(tp_group, 0)
+
+    # Fixed-size buffer: [n_elements, max_seqlen, cu_seqlens...]
+    buf_size = args.seq_length + 2
+    buf = torch.zeros(buf_size, dtype=torch.int32, device=device)
+
+    if tp_rank == 0:
+        cu_sq = packed_seq_params.cu_seqlens_q
+        msv = packed_seq_params.max_seqlen_q
+        n = cu_sq.shape[0]
+        buf[0] = n
+        buf[1] = int(msv.item() if hasattr(msv, "item") else msv)
+        buf[2:2 + n] = cu_sq.to(dtype=torch.int32, device=device)
+
+    dist.broadcast(buf, src=tp_src_global, group=tp_group)
+
+    if tp_rank != 0:
+        n = int(buf[0].item())
+        max_seqlen = int(buf[1].item())
+        cu_seqlens = buf[2:2 + n].clone()
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            qkv_format='thd',
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+        )
+
+    return packed_seq_params
+
+
+def get_batch(data_iterator, vp_stage=None):
+    """Generate a batch with packed-sequence + CP/PP support.
+
+    Overview of the approach for each PP stage type:
+
+    - First/last PP stages: all TP ranks compute packed_seq_params independently
+    from identical data (broadcasted via get_batch_on_this_tp_rank). When PP > 1
+    and TP > 1, missing batch fields on non-zero TP ranks are filled in first.
+
+    - Middle PP stages: TP-rank-0 computes packed_seq_params from its local
+    dataloader and broadcasts to sibling TP ranks. Batch values != packed_seq_params
+    are set to None since activations arrive via PP P2P, not from the dataloader.
+    """
+    args = get_args()
+
+    if not is_first_or_last_pipeline_stage(vp_stage):
+        if not args.use_packed_seq_params:
+            return (None, None, None, None, None), None
+
+        # All TP ranks must call get_batch_on_this_tp_rank (it's a collective).
+        batch = get_batch_on_this_tp_rank(data_iterator)
+        device = torch.cuda.current_device()
+
+        packed_seq_params = _compute_and_broadcast_packed_seq_params(batch, args, device)
+        return (None, None, None, None, None), packed_seq_params
+
+    batch = get_batch_on_this_tp_rank(data_iterator)
+
+    if not args.use_packed_seq_params:
         batch = get_batch_on_this_cp_rank(batch)
+        return batch.values(), None
+
+    cp_size = parallel_state.get_context_parallel_world_size()
+    device = torch.cuda.current_device()
+    tokenizer = get_tokenizer()
+
+    # When PP > 1, the last stage's non-zero TP ranks has tokens=None
+    # (get_batch_on_this_tp_rank only broadcasts what that stage needs for
+    # loss computation).  If CP > 1, all TP ranks must run the CP padding
+    # logic (which reads tokens), so we fill in the missing fields first.
+    
+    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+
+    if pp_size > 1 and tp_size > 1:
+        _ensure_complete_batch_on_all_tp_ranks(batch, device)
+
+    packed_seq_params, batch = _packed_seq_params_from_batch(
+        batch, args, tokenizer, cp_size, device
+    )
 
     return batch.values(), packed_seq_params
 
@@ -485,6 +582,12 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
 
 def is_dataset_built_on_rank(vp_stage=None):
+    args = get_args()
+    # When use_packed_seq_params is enabled, ALL PP stages build a dataloader
+    # on TP-rank-0. Middle stages use it only to compute cu_seqlens locally,
+    # avoiding cross-stage P2P for packed sequence metadata.
+    if args.use_packed_seq_params:
+        return parallel_state.get_tensor_model_parallel_rank() == 0
     return is_first_or_last_pipeline_stage(vp_stage) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 

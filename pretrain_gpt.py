@@ -116,7 +116,10 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
             get_batch_on_this_cp_rank as te_get_batch_on_this_cp_rank,
         )
 
-        _divisibility = 2 * cp_size
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        sp_enabled = getattr(args, 'sequence_parallel', False)
+
+        _divisibility = 2 * cp_size * (tp_size if sp_enabled else 1)
         _seq_lens = cu_seq[1:] - cu_seq[:-1]
         _keep = torch.cat([
             torch.tensor([True], device=device),
@@ -124,7 +127,8 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
         ])
         cu_seq = cu_seq[_keep]
 
-        divisibility = 2 * cp_size
+        divisibility = 2 * cp_size * (tp_size if sp_enabled else 1)
+
         cp_group = parallel_state.get_context_parallel_group()
         cp_rank = parallel_state.get_context_parallel_rank()
 

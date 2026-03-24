@@ -616,6 +616,7 @@ def topk_routing_with_score_function(
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
+    mock: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -649,6 +650,10 @@ def topk_routing_with_score_function(
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
+    if mock:
+        noise = torch.normal(0, 1, size=logits.shape, device=logits.device)
+        logits = 1e-12 * logits + noise
+    
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(

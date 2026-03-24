@@ -480,6 +480,8 @@ class TransformerConfig(ModelParallelConfig):
     fp8_multi_head_attention: bool = False
     """When set to True, use the FP8 implementation of Multi Head Attention."""
 
+    fp8_activation: bool = False
+
     tp_only_amax_red: bool = False
     """When set to True, reduce the FP8 AMAX only in the TP or TP-CP domain"""
 
@@ -655,6 +657,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_use_legacy_grouped_gemm: bool = False
     """Use legacy GroupedMLP rather than TEGroupedMLP.
     Note: The legacy one will be deprecated soon."""
+
+    moe_use_custom_function: bool = False
+
+    moe_mock_router: bool = False
 
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.

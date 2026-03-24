@@ -581,6 +581,7 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                mock=self.config.moe_mock_router,
             )
 
         # Apply token dropping to probs and routing_map.

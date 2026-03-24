@@ -30,6 +30,13 @@ class ProfilingConfig:
     --capture-range=cudaProfilerApi --capture-range-end=stop`.
     """
 
+    nsys_profile_step_start: int = 10
+    """Global step to start nsys profiling."""
+
+    nsys_profile_step_end: int = 12
+    """Global steps to start and stop nsys profiling. """
+
+
     profile_step_start: int = 10
     """Global step to start profiling."""
 

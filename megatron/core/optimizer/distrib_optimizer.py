@@ -931,6 +931,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if k == "param":
                     self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
+                    # Tmp fix
+                    if k == "padding":
+                        continue
+                    if torch.distributed.get_rank() == 0:
+                        print(f"tensor k: {tensors.keys()}")
+                        print(f"set_scaled_state k: {k}")
+                        print(f"set_scaled_state v: {v}")
                     self.optimizer.set_scaled_state(sharded_model_param, k, v)
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]

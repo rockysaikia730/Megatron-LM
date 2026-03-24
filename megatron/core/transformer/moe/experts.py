@@ -40,6 +40,9 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
 )
+from megatron.core.transformer.moe.experts_util import (
+    grouped_swiglu_mlp
+)
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -242,6 +245,18 @@ class GroupedMLP(MegatronModule):
             # Reshape the weights for the grouped GEMMs.
             w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
             w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
+
+            if self.config.moe_use_custom_function:
+                output = grouped_swiglu_mlp(
+                    w1,
+                    w2,
+                    permuted_local_hidden_states,
+                    tokens_per_expert,
+                    permuted_probs,
+                    self.config
+                )
+
+                return output, None
 
             fc1_output = gg.ops.gmm(
                 permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False

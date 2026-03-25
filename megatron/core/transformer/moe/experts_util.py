@@ -472,10 +472,14 @@ class GroupedSwiMLP(torch.autograd.Function):
         w2: torch.nn.Parameter = ctx.w2
         (x, a, probs) = ctx.saved_tensors
 
+        # rematerialize activation if needed
+        # NOTE: fp8 tensors have to be manually released after dequantization
         if config.fp8_activation:
             x = ctx.qx.dequantize()
+            release(ctx.qx)
             if not ctx.activation_recompute:
                 a = ctx.qa.dequantize()
+                release(ctx.qa)
             else:
                 a = GroupedSwiMLP.call_forward_a(
                     w1, x, tokens_per_expert

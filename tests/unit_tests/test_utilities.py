@@ -48,7 +48,7 @@ class Utils:
             torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
             init_method = 'tcp://'
             master_ip = os.getenv('MASTER_ADDR', 'localhost')
-            master_port = os.getenv('MASTER_PORT', '6000')
+            master_port = os.getenv('MASTER_PORT', '23450')
             init_method += master_ip + ':' + master_port
             rendezvous_iterator = rendezvous(
                 init_method, Utils.rank, Utils.world_size, timeout=timedelta(minutes=1)

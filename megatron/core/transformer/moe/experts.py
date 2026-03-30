@@ -242,21 +242,23 @@ class GroupedMLP(MegatronModule):
             permuted_probs = torch.ones_like(permuted_probs)
 
         if permuted_local_hidden_states.nelement() != 0:
-            # Reshape the weights for the grouped GEMMs.
-            w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
-            w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
 
             if self.config.moe_use_custom_function:
                 output = grouped_swiglu_mlp(
-                    w1,
-                    w2,
+                    self.weight1,
+                    self.weight2,
                     permuted_local_hidden_states,
                     tokens_per_expert,
+                    self.num_local_experts,
                     permuted_probs,
                     self.config
                 )
 
                 return output, None
+            
+            # Reshape the weights for the grouped GEMMs.
+            w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
+            w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
 
             fc1_output = gg.ops.gmm(
                 permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False

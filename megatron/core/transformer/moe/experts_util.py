@@ -306,6 +306,8 @@ class GroupedSwiMLP(torch.autograd.Function):
         a: torch.Tensor,
         w2: torch.nn.Parameter,
         tokens_per_expert: torch.Tensor,
+        num_local_experts: int,
+        w2_slice_shape: tuple,
         permuted_probs: torch.Tensor,
         fuse_gradient_accumulation: bool = False,
     ) -> torch.Tensor:
@@ -329,9 +331,13 @@ class GroupedSwiMLP(torch.autograd.Function):
             tokens_per_expert,
             trans_a=True,
             trans_b=False,
-            c = None if not fuse_gradient_accumulation else w2.main_grad
+            c = None if not fuse_gradient_accumulation \
+                else w2.main_grad.view(w2_slice_shape),
+            alpha = 1.0,
+            beta = 0.0 if not fuse_gradient_accumulation else 1.0,
         )
-        return grad_w2
+        w2.grad_added_to_main_grad = fuse_gradient_accumulation
+        return grad_w2.view(w2.shape)
 
     @classmethod
     def call_backward_grad_w1(
@@ -340,6 +346,8 @@ class GroupedSwiMLP(torch.autograd.Function):
         x: torch.Tensor,
         w1: torch.nn.Parameter,
         tokens_per_expert: torch.Tensor,
+        num_local_experts: int,
+        w1_slice_shape: tuple,
         fuse_gradient_accumulation: bool = False,
     ) -> torch.Tensor:
         """Calculate the gradient of the weight parameter for the first linear layer in the backward pass.
@@ -361,9 +369,13 @@ class GroupedSwiMLP(torch.autograd.Function):
             tokens_per_expert,
             trans_a=True,
             trans_b=False,
-            c = None if not fuse_gradient_accumulation else w1.main_grad
+            c = None if not fuse_gradient_accumulation \
+                else w1.main_grad.view(w1_slice_shape),
+            alpha = 1.0,
+            beta = 0.0 if not fuse_gradient_accumulation else 1.0,
         )
-        return grad_w1
+        w1.grad_added_to_main_grad = fuse_gradient_accumulation
+        return grad_w1.view(w1.shape)
 
 
     @staticmethod
@@ -372,31 +384,38 @@ class GroupedSwiMLP(torch.autograd.Function):
         *args, 
         **kwargs
     ):
-        if len(args) < 6:
+        if len(args) < 7:
             raise ValueError(f"Insufficient arguments for forward pass of GroupedSwiMLP. Expected at least 6, got {len(args)}")
         
         w1: torch.nn.Parameter = args[0]
         w2: torch.nn.Parameter = args[1]
         permuted_local_hidden_states: torch.Tensor = args[2]
         tokens_per_expert: torch.Tensor = args[3]
-        permuted_probs: torch.Tensor = args[4]
-        config: TransformerConfig = args[5]
+        num_local_experts: int = args[4]
+        permuted_probs: torch.Tensor = args[5]
+        config: TransformerConfig = args[6]
+
+        w1_slice_shape = (num_local_experts, config.hidden_size, -1)
+        w2_slice_shape = (num_local_experts, -1, config.hidden_size)
 
         # mlp1
         a = GroupedSwiMLP.call_forward_a(
-            w1, permuted_local_hidden_states, tokens_per_expert
+            w1.view(w1_slice_shape), permuted_local_hidden_states, tokens_per_expert
         )
 
         # act + mlp2
         y, _ = GroupedSwiMLP.call_forward_y(
-            w2, a, tokens_per_expert, permuted_probs
+            w2.view(w2_slice_shape), a, tokens_per_expert, permuted_probs
         )
 
         # context saving
         ctx.w1 = w1
         ctx.w2 = w2
         ctx.tokens_per_expert = tokens_per_expert
+        ctx.num_local_experts = num_local_experts
         ctx.config = config
+        ctx.w1_slice_shape = w1_slice_shape
+        ctx.w2_slice_shape = w2_slice_shape
 
         activation_recompute = (
             config.recompute_granularity == 'selective'
@@ -468,9 +487,12 @@ class GroupedSwiMLP(torch.autograd.Function):
     ):
         config: TransformerConfig = ctx.config
         tokens_per_expert: torch.Tensor = ctx.tokens_per_expert
+        num_local_experts: int = ctx.num_local_experts
         w1: torch.nn.Parameter = ctx.w1
         w2: torch.nn.Parameter = ctx.w2
         (x, a, probs) = ctx.saved_tensors
+        w1_slice_shape = ctx.w1_slice_shape
+        w2_slice_shape = ctx.w2_slice_shape
 
         # rematerialize activation if needed
         # NOTE: fp8 tensors have to be manually released after dequantization
@@ -482,7 +504,7 @@ class GroupedSwiMLP(torch.autograd.Function):
                 release(ctx.qa)
             else:
                 a = GroupedSwiMLP.call_forward_a(
-                    w1, x, tokens_per_expert
+                    w1.view(w1_slice_shape), x, tokens_per_expert
                 )
 
         grad_y = grad_outputs[0].contiguous()
@@ -491,14 +513,14 @@ class GroupedSwiMLP(torch.autograd.Function):
         grad_a, grad_probs = GroupedSwiMLP.call_backward_grad_a(
             grad_y, 
             a, 
-            w2, 
+            w2.view(w2_slice_shape), 
             tokens_per_expert,
             probs,
         )
 
         grad_x = None if grad_a is None else GroupedSwiMLP.call_backward_grad_x(
             grad_a,
-            w1,
+            w1.view(w1_slice_shape),
             tokens_per_expert,
         )
 
@@ -507,23 +529,30 @@ class GroupedSwiMLP(torch.autograd.Function):
             a,
             w2,
             tokens_per_expert, 
-            probs
+            num_local_experts,
+            w2_slice_shape,
+            probs,
+            config.gradient_accumulation_fusion,
         )
 
         grad_w1 = None if grad_a is None else GroupedSwiMLP.call_backward_grad_w1(
             grad_a, 
             x, 
             w1,
-            tokens_per_expert
+            tokens_per_expert,
+            num_local_experts,
+            w1_slice_shape,
+            config.gradient_accumulation_fusion,
         )
 
-        return grad_w1, grad_w2, grad_x, None, grad_probs, None
+        return grad_w1, grad_w2, grad_x, None, None, grad_probs, None
     
 def grouped_swiglu_mlp(
     w1: torch.nn.Parameter,
     w2: torch.nn.Parameter,
     permuted_local_hidden_states: torch.Tensor,
     tokens_per_expert: torch.Tensor,
+    num_local_experts: int,
     permuted_probs: torch.Tensor,
     config: TransformerConfig,
 ) -> torch.Tensor:
@@ -545,6 +574,7 @@ def grouped_swiglu_mlp(
         w2, 
         permuted_local_hidden_states,
         tokens_per_expert,
+        num_local_experts,
         permuted_probs,
         config,
     )

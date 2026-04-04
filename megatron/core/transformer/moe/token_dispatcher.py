@@ -344,6 +344,80 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         """Restores the original tensor shape."""
         return hidden_states.view(self.hidden_shape)
 
+class MoEAlltoAllTokenDispatcherFunction(torch.autograd.Function):
+
+    @staticmethod
+    def all2all_dispatch(
+        group,
+        input,
+        output_split_sizes=None,
+        input_split_sizes=None,
+    ):
+        world_size = group.size()
+        # Bypass the function if we are using only 1 GPU.
+        if world_size == 1:
+            return input
+
+        input = input.contiguous()
+        if output_split_sizes is None:
+            # Equal split (all2all)
+            output = torch.empty_like(input)
+        else:
+            # Unequal split (all2all-v)
+            output = input.new_empty(
+                size=[sum(output_split_sizes)] + list(input.size()[1:]),
+                dtype=input.dtype,
+                device=torch.cuda.current_device(),
+            )
+        torch.distributed.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+        )
+
+        return output
+
+    @staticmethod
+    def forward(
+        ctx, 
+        ep_group,
+        output_splits,
+        input_splits,
+        permutated_local_input_tokens, 
+        permuted_probs,
+    ):
+        ctx.ep_group = ep_group
+        ctx.output_splits = output_splits
+        ctx.input_splits = input_splits
+
+        global_probs = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+            ep_group, permuted_probs, output_splits, input_splits
+        )
+        global_input_tokens = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+            ep_group, permutated_local_input_tokens, output_splits, input_splits
+        )
+        return global_input_tokens, global_probs
+
+    @staticmethod
+    def backward(
+        ctx, 
+        grad_hidden_states, 
+        grad_probs
+    ):
+        ep_group = ctx.ep_group
+        output_splits = ctx.output_splits
+        input_splits = ctx.input_splits
+
+        # The backward of token dispatch is the same as token combine.
+        global_grad_probs = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+            ep_group, grad_probs, input_splits, output_splits
+        )
+        global_grad_hidden_states = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+            ep_group, grad_hidden_states, input_splits, output_splits
+        )
+        return None, None, None, global_grad_hidden_states, global_grad_probs
 
 class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     """
@@ -663,12 +737,19 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
-        global_input_tokens = all_to_all(
-            self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
+        global_input_tokens, global_probs = MoEAlltoAllTokenDispatcherFunction.apply(
+            self.ep_group,
+            self.output_splits,
+            self.input_splits,
+            permutated_local_input_tokens,
+            permuted_probs,
         )
-        global_probs = all_to_all(
-            self.ep_group, permuted_probs, self.output_splits, self.input_splits
-        )
+        # global_probs = all_to_all(
+        #     self.ep_group, permuted_probs, self.output_splits, self.input_splits
+        # )
+        # global_input_tokens = all_to_all(
+        #     self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
+        # )
 
         return global_input_tokens, global_probs
 

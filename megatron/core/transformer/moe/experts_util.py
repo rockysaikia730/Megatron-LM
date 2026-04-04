@@ -2,6 +2,7 @@
 from __future__ import annotations
 import torch
 import collections
+import queue
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -18,6 +19,24 @@ try:
     import grouped_gemm
 except ImportError:
     grouped_gemm = None
+
+class ExpertsWgradScheduler:
+    def __init__(self, delay_wgrad_compute: bool = False):
+        self.delay_wgrad_compute = delay_wgrad_compute
+        self.queue = queue.Queue()
+
+    def register(self, grad_func, *grad_parms):
+        if self.delay_wgrad_compute:
+            self.queue.put((grad_func, grad_parms))
+
+    def pop_callback(self):
+        if self.queue.qsize() > 0 and self.delay_wgrad_compute:
+            grad_func, grad_parms = self.queue.get()
+            return grad_func(*grad_parms)
+        else:
+            # If there is no token assigned to the expert in this MoE layer,
+            # then there will be case that the wgrad compute is not registered
+            return
         
 
 class MergedSwiGLU(torch.autograd.Function):
@@ -298,6 +317,19 @@ class GroupedSwiMLP(torch.autograd.Function):
         )
 
         return grad_x
+    
+    @staticmethod
+    def _wgrad_post_process(
+        w: torch.nn.Parameter,
+        wgrad_output: torch.Tensor,
+        fuse_gradient_accumulation: bool,
+    ):
+        # handle ddp
+        if fuse_gradient_accumulation:
+            w.grad_added_to_main_grad = True
+        else:
+            w.grad_added_to_main_grad = False
+            w.grad = wgrad_output.view(w.shape)
 
     @classmethod
     def call_backward_grad_w2(
@@ -309,6 +341,8 @@ class GroupedSwiMLP(torch.autograd.Function):
         num_local_experts: int,
         w2_slice_shape: tuple,
         permuted_probs: torch.Tensor,
+        wgrad_scheduler: ExpertsWgradScheduler = None,
+        delay_wgrad_compute: bool = False,
         fuse_gradient_accumulation: bool = False,
     ) -> torch.Tensor:
         """Calculate the gradient of the weight parameter for the second linear layer in the backward pass.
@@ -325,6 +359,37 @@ class GroupedSwiMLP(torch.autograd.Function):
             torch.Tensor: gradient of the weight parameter for the second linear layer
         """
         s = MergedSwiGLU.call_forward(a, permuted_probs.unsqueeze(-1))
+
+        # If delay_wgrad_compute is True and wgrad_scheduler is provided, 
+        # register the wgrad computation to be executed later.
+        if delay_wgrad_compute and wgrad_scheduler is not None:
+            def _compute_w2_grad(*args):
+                grouped_gemm.grouped_gemm.backend.gmm(*args)   
+
+            wgrad_output = None
+            alpha = 1.0
+            beta = 0.0
+            if fuse_gradient_accumulation:
+                wgrad_output = w2.main_grad
+                beta = 1.0
+            else:
+                wgrad_output = torch.empty(
+                    w2.shape, 
+                    device=w2.device, 
+                    dtype=w2.dtype
+                )
+                beta = 0.0
+
+            wgrad_scheduler.register(
+                _compute_w2_grad,
+                s, grad_y, tokens_per_expert, True, False, wgrad_output.data.view(w2_slice_shape), alpha, beta
+            )
+
+            # handle ddp
+            GroupedSwiMLP._wgrad_post_process(w2, wgrad_output, fuse_gradient_accumulation)
+            return wgrad_output.view(w2.shape)
+        
+        # compute wgrad immediately if not delay_wgrad_compute or wgrad_scheduler is None
         grad_w2 = grouped_gemm.grouped_gemm.backend.gmm(
             s, 
             grad_y,
@@ -336,7 +401,9 @@ class GroupedSwiMLP(torch.autograd.Function):
             alpha = 1.0,
             beta = 0.0 if not fuse_gradient_accumulation else 1.0,
         )
-        w2.grad_added_to_main_grad = fuse_gradient_accumulation
+
+        # post process wgrad for ddp
+        GroupedSwiMLP._wgrad_post_process(w2, grad_w2, fuse_gradient_accumulation)
         return grad_w2.view(w2.shape)
 
     @classmethod
@@ -348,6 +415,8 @@ class GroupedSwiMLP(torch.autograd.Function):
         tokens_per_expert: torch.Tensor,
         num_local_experts: int,
         w1_slice_shape: tuple,
+        wgrad_scheduler: ExpertsWgradScheduler = None,
+        delay_wgrad_compute: bool = False,
         fuse_gradient_accumulation: bool = False,
     ) -> torch.Tensor:
         """Calculate the gradient of the weight parameter for the first linear layer in the backward pass.
@@ -363,6 +432,34 @@ class GroupedSwiMLP(torch.autograd.Function):
         Returns:
             torch.Tensor: gradient of the weight parameter for the first linear layer
         """
+        if delay_wgrad_compute and wgrad_scheduler is not None:
+            def _compute_w1_grad(*args):
+                grouped_gemm.grouped_gemm.backend.gmm(*args)
+
+            wgrad_output = None
+            alpha = 1.0
+            beta = 0.0
+            if fuse_gradient_accumulation:
+                wgrad_output = w1.main_grad
+                beta = 1.0
+            else:
+                wgrad_output = torch.empty(
+                    w1.shape, 
+                    device=w1.device, 
+                    dtype=w1.dtype
+                )
+                beta = 0.0
+            
+            wgrad_scheduler.register(
+                _compute_w1_grad,
+                x, grad_a, tokens_per_expert, True, False, wgrad_output.data.view(w1_slice_shape), alpha, beta
+            )
+
+            # post process wgrad for ddp
+            GroupedSwiMLP._wgrad_post_process(w1, wgrad_output, fuse_gradient_accumulation)
+            return wgrad_output.view(w1.shape)
+        
+        # compute wgrad immediately if not delay_wgrad_compute or wgrad_scheduler is None
         grad_w1 = grouped_gemm.grouped_gemm.backend.gmm(
             x,
             grad_a,
@@ -374,9 +471,10 @@ class GroupedSwiMLP(torch.autograd.Function):
             alpha = 1.0,
             beta = 0.0 if not fuse_gradient_accumulation else 1.0,
         )
-        w1.grad_added_to_main_grad = fuse_gradient_accumulation
-        return grad_w1.view(w1.shape)
 
+        # post process wgrad for ddp
+        GroupedSwiMLP._wgrad_post_process(w1, grad_w1, fuse_gradient_accumulation)
+        return grad_w1.view(w1.shape)
 
     @staticmethod
     def forward(
@@ -393,7 +491,8 @@ class GroupedSwiMLP(torch.autograd.Function):
         tokens_per_expert: torch.Tensor = args[3]
         num_local_experts: int = args[4]
         permuted_probs: torch.Tensor = args[5]
-        config: TransformerConfig = args[6]
+        expert_wgrad_scheduler: ExpertsWgradScheduler = args[6]
+        config: TransformerConfig = args[7]
 
         w1_slice_shape = (num_local_experts, config.hidden_size, -1)
         w2_slice_shape = (num_local_experts, -1, config.hidden_size)
@@ -409,6 +508,7 @@ class GroupedSwiMLP(torch.autograd.Function):
         )
 
         # context saving
+        ctx.expert_wgrad_scheduler = expert_wgrad_scheduler
         ctx.w1 = w1
         ctx.w2 = w2
         ctx.tokens_per_expert = tokens_per_expert
@@ -493,6 +593,7 @@ class GroupedSwiMLP(torch.autograd.Function):
         (x, a, probs) = ctx.saved_tensors
         w1_slice_shape = ctx.w1_slice_shape
         w2_slice_shape = ctx.w2_slice_shape
+        expert_wgrad_scheduler: ExpertsWgradScheduler = ctx.expert_wgrad_scheduler
 
         # rematerialize activation if needed
         # NOTE: fp8 tensors have to be manually released after dequantization
@@ -503,6 +604,11 @@ class GroupedSwiMLP(torch.autograd.Function):
                 a = ctx.qa.dequantize()
                 release(ctx.qa)
             else:
+                a = GroupedSwiMLP.call_forward_a(
+                    w1.view(w1_slice_shape), x, tokens_per_expert
+                )
+        else:
+            if ctx.activation_recompute:
                 a = GroupedSwiMLP.call_forward_a(
                     w1.view(w1_slice_shape), x, tokens_per_expert
                 )
@@ -532,6 +638,8 @@ class GroupedSwiMLP(torch.autograd.Function):
             num_local_experts,
             w2_slice_shape,
             probs,
+            expert_wgrad_scheduler,
+            config.delay_wgrad_compute,
             config.gradient_accumulation_fusion,
         )
 
@@ -542,10 +650,12 @@ class GroupedSwiMLP(torch.autograd.Function):
             tokens_per_expert,
             num_local_experts,
             w1_slice_shape,
+            expert_wgrad_scheduler,
+            config.delay_wgrad_compute,
             config.gradient_accumulation_fusion,
         )
 
-        return grad_w1, grad_w2, grad_x, None, None, grad_probs, None
+        return grad_w1, grad_w2, grad_x, None, None, grad_probs, None, None
     
 def grouped_swiglu_mlp(
     w1: torch.nn.Parameter,
@@ -554,6 +664,7 @@ def grouped_swiglu_mlp(
     tokens_per_expert: torch.Tensor,
     num_local_experts: int,
     permuted_probs: torch.Tensor,
+    expert_wgrad_scheduler: ExpertsWgradScheduler,
     config: TransformerConfig,
 ) -> torch.Tensor:
     """Autograd function for Grouped SwiGLU MLP.
@@ -576,6 +687,7 @@ def grouped_swiglu_mlp(
         tokens_per_expert,
         num_local_experts,
         permuted_probs,
+        expert_wgrad_scheduler,
         config,
     )
 

@@ -41,7 +41,8 @@ from megatron.core.transformer.moe.moe_utils import (
     get_align_size_for_quantization,
 )
 from megatron.core.transformer.moe.experts_util import (
-    grouped_swiglu_mlp
+    grouped_swiglu_mlp,
+    ExpertsWgradScheduler,
 )
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -85,9 +86,9 @@ class GroupedMLP(MegatronModule):
         assert (
             config.add_bias_linear == False
         ), "bias not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
-        assert (
-            config.moe_latent_size is None
-        ), "MoE latent projection not supported in GroupedMLP yet."
+        # assert (
+        #     config.moe_latent_size is None
+        # ), "MoE latent projection not supported in GroupedMLP yet."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
@@ -128,6 +129,9 @@ class GroupedMLP(MegatronModule):
         tp_size = self.tp_group.size()
         tp_rank = self.tp_group.rank()
 
+        self.input_size = self.config.hidden_size \
+            if self.config.moe_latent_size is None \
+            else self.config.moe_latent_size
         fc1_output_size = self.config.moe_ffn_hidden_size * self.num_local_experts
         if config.gated_linear_unit:
             # Project to 4h. If using swiglu double the output width,
@@ -146,20 +150,22 @@ class GroupedMLP(MegatronModule):
         if config.use_cpu_initialization:
             self.weight1 = Parameter(
                 torch.empty(
-                    self.config.hidden_size,
+                    self.input_size,
                     fc1_output_size_per_partition,
                     dtype=config.params_dtype,
                 )
             )
             self.weight2 = Parameter(
                 torch.empty(
-                    fc2_input_size_per_partition, self.config.hidden_size, dtype=config.params_dtype
+                    fc2_input_size_per_partition, 
+                    self.input_size, 
+                    dtype=config.params_dtype
                 )
             )
             if config.perform_initialization:
                 _initialize_affine_weight_cpu(
                     self.weight1,
-                    self.config.hidden_size,
+                    self.input_size,
                     fc1_output_size,
                     fc1_output_size_per_partition,
                     partition_dim=1,
@@ -171,7 +177,7 @@ class GroupedMLP(MegatronModule):
                 _initialize_affine_weight_cpu(
                     self.weight2,
                     fc2_input_size,
-                    self.config.hidden_size,
+                    self.input_size,
                     fc2_input_size_per_partition,
                     partition_dim=0,
                     init_method=config.output_layer_init_method,
@@ -218,6 +224,15 @@ class GroupedMLP(MegatronModule):
 
         self.register_load_state_dict_post_hook(remove_extra_states_check)
 
+        # register delay wgrad computation
+        # check distribured_data_parallel.py
+        self.wgrad_accumulation_and_reduce_hooks = []
+        self.expert_wgrad_scheduler = None
+        if config.moe_use_custom_function and config.delay_wgrad_compute:
+            self.expert_wgrad_scheduler = ExpertsWgradScheduler(config.delay_wgrad_compute)
+            self.weight1.skip_backward_post_hook = True
+            self.weight2.skip_backward_post_hook = True
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -251,6 +266,7 @@ class GroupedMLP(MegatronModule):
                     tokens_per_expert,
                     self.num_local_experts,
                     permuted_probs,
+                    self.expert_wgrad_scheduler,
                     self.config
                 )
 
@@ -523,7 +539,17 @@ class GroupedMLP(MegatronModule):
         """Performs backward pass for weight gradients in Experts.
         Empty implementation for compatibility with SequentialMLP and TEGroupedMLP.
         """
-        pass
+        if self.config.moe_use_custom_function and self.config.delay_wgrad_compute:
+            self.expert_wgrad_scheduler.pop_callback()  # w2 grad
+            self.expert_wgrad_scheduler.pop_callback()  # w1 grad
+
+            # trigger grad reduce hook
+            for hook_fn in self.wgrad_accumulation_and_reduce_hooks:
+                hook_fn()
+
+    def register_wgrad_accumulation_and_reduce_hooks(self, hook_fn):
+        if self.config.moe_use_custom_function and self.config.delay_wgrad_compute:
+            self.wgrad_accumulation_and_reduce_hooks.append(hook_fn)
 
 
 class TEGroupedMLP(MegatronModule):

@@ -51,6 +51,7 @@ class TransformerLayerSchedulePlan:
     moe_dispatch = None
     mlp = None
     moe_combine = None
+    moe_post_combine = None
     mtp_post_process = None
 
     def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
@@ -152,6 +153,7 @@ class TransformerLayerSchedulePlan:
             moe_dispatch_module,
             mlp_module,
             moe_combine_module,
+            moe_post_combine_module,
             mtp_post_process_module,
         ) = fwd_callables
 
@@ -162,9 +164,11 @@ class TransformerLayerSchedulePlan:
         if is_moe:
             self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
             self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
+            self.moe_post_combine = create_node(comm_stream, moe_post_combine_module, "moe_post_combine")
         else:
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
+            self.moe_post_combine = NoopScheduleNode()
 
         if is_mtp:
             self.mtp_post_process = create_node(
@@ -214,6 +218,7 @@ class TransformerLayerSchedulePlan:
 
         if b_layer is not None:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
+            b_grad = b_layer.moe_post_combine.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
@@ -223,6 +228,8 @@ class TransformerLayerSchedulePlan:
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
 
+        # Forward dispatch can be moved before b_layer.mlp.backward(b_grad)
+        # to enable an overlap between dispatch and bw + wgard_bw
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.moe_dispatch.forward(f_input)
@@ -241,10 +248,15 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.moe_combine.forward(f_input)
-                f_input = f_layer.mtp_post_process.forward(f_input)
+                # f_input = f_layer.mtp_post_process.forward(f_input)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.attn.backward(b_grad)
+        
+        if f_layer is not None:
+            with f_layer.get_fp8_context():
+                f_input = f_layer.moe_post_combine.forward(f_input)
+                f_input = f_layer.mtp_post_process.forward(f_input)
 
         # Delay the last attn_dw in backward pass (attn_dw of the first layer)
         # for overlapping with the p2p comm

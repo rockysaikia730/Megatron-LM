@@ -550,9 +550,46 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # microbatch. If `mlp_bda` were to run first, it would compete for SM resources
         # with another microbatch's computation and expose the communication.
         """
+        output = layer.mlp.combine(output)
+        return output
+        
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
-        output = layer.mlp.combine(output)
+        output = layer.mlp.postprocess(output, shared_expert_output)
+
+        mlp_output_with_bias = (output, None)
+        if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
+            layer.mlp.cudagraph_tensor_store.clear()
+        with layer.bias_dropout_add_exec_handler():
+            hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
+                mlp_output_with_bias, residual, layer.hidden_dropout
+            )
+        # Delay the offload of the mlp norm until after the mlp_bda has been computed
+        # because the residual is needed in the mlp_bda.
+        if layer.offload_mlp_norm:
+            hidden_states = off_interface.group_commit(
+                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+            )
+        output = make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
+        # Need to record residual to comm stream, since it's created on comp stream
+        node.layer_state.residual.record_stream(torch.cuda.current_stream())
+
+        # release tensor reference after use
+        node.layer_state.residual = None
+
+        # final layer norm from decoder
+        final_layernorm = node.chunk_state.model.decoder.final_layernorm
+        if not node.is_mtp and final_layernorm and node.is_last_layer:
+            output = final_layernorm(output)
+            output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
+        return output
+    
+    def submodule_post_combine_forward(node: ScheduleNode, output: torch.Tensor):
+        residual = node.layer_state.residual
+        shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
         output = layer.mlp.postprocess(output, shared_expert_output)
 
         mlp_output_with_bias = (output, None)
@@ -585,6 +622,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
         return output
 
+
     def mlp_wrapper(node: ScheduleNode, *args, **kwargs):
         """Wrapper for Dense forward."""
         return layer._forward_mlp(*args, **kwargs)
@@ -598,10 +636,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     dispatch_func = submodule_dispatch_forward if is_moe else raise_not_implemented
     mlp_func = submodule_moe_forward if is_moe else mlp_wrapper
     combine_func = submodule_combine_forward if is_moe else raise_not_implemented
+    post_combine_func = submodule_post_combine_forward if is_moe else raise_not_implemented
 
     layer.init_backward_dw_wrapper()
 
-    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, None]
+    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, post_combine_func, None]
     backward_dw = {"attn": layer.backward_dw_wrapper, "mlp": layer.mlp}
     return forward_funcs, backward_dw
 

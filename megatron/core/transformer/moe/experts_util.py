@@ -494,8 +494,9 @@ class GroupedSwiMLP(torch.autograd.Function):
         expert_wgrad_scheduler: ExpertsWgradScheduler = args[6]
         config: TransformerConfig = args[7]
 
-        w1_slice_shape = (num_local_experts, config.hidden_size, -1)
-        w2_slice_shape = (num_local_experts, -1, config.hidden_size)
+        input_size = config.hidden_size if config.moe_latent_size is None else config.moe_latent_size
+        w1_slice_shape = (num_local_experts, input_size, -1)
+        w2_slice_shape = (num_local_experts, -1, input_size)
 
         # mlp1
         a = GroupedSwiMLP.call_forward_a(

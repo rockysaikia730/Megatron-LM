@@ -188,7 +188,7 @@ class GroupedMLP(MegatronModule):
         else:
             self.weight1 = Parameter(
                 torch.empty(
-                    self.config.hidden_size,
+                    self.input_size,
                     fc1_output_size_per_partition,
                     device=torch.cuda.current_device(),
                     dtype=config.params_dtype,
@@ -197,7 +197,7 @@ class GroupedMLP(MegatronModule):
             self.weight2 = Parameter(
                 torch.empty(
                     fc2_input_size_per_partition,
-                    self.config.hidden_size,
+                    self.input_size,
                     device=torch.cuda.current_device(),
                     dtype=config.params_dtype,
                 )
@@ -273,8 +273,8 @@ class GroupedMLP(MegatronModule):
                 return output, None
             
             # Reshape the weights for the grouped GEMMs.
-            w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
-            w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
+            w1 = self.weight1.view(self.num_local_experts, self.input_size, -1)
+            w2 = self.weight2.view(self.num_local_experts, -1, self.input_size)
 
             fc1_output = gg.ops.gmm(
                 permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False

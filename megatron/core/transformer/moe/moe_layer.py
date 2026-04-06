@@ -169,6 +169,11 @@ class MoELayer(BaseMoELayer):
         # Initialize latent projections.
         if self.config.moe_latent_size:
             assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
+            # latent projection for now does not support delayed wgrad compute, 
+            # so we need to disable it for the projection layers.
+            # check model_chunk_schedule_plan.py
+            delay_wgrad_compute = self.config.delay_wgrad_compute
+            self.config.delay_wgrad_compute = False
             self.fc1_latent_proj = TELinear(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -191,6 +196,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
             )
+            self.config.delay_wgrad_compute = delay_wgrad_compute
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":

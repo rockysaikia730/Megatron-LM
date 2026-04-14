@@ -20,6 +20,7 @@ from megatron.core.transformer.moe.moe_utils import (
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
     z_loss_func,
+    get_moe_metrics_tracker,
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -658,6 +659,18 @@ class TopKRouter(Router):
             logits = apply_random_logits(logits)
 
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+
+        if self.training:
+            with torch.no_grad():
+                load_imbalance_tracker, expert_path_tracker = get_moe_metrics_tracker()
+                tokens_per_expert = routing_map.sum(dim=0).float().cpu()
+                expert_path = expert_path_tracker.get("expert_path", torch.zeros(self.config.num_layers, self.num_experts, device="cpu"))
+                expert_path[self.layer_number-1] += tokens_per_expert
+                expert_path_tracker["expert_path"] = expert_path
+                if self.layer_number % 4 == 0:
+                    imbalance_ratio = tokens_per_expert.max() / (tokens_per_expert.mean())
+                    key = f"moe/load_imbalance_layer_{self.layer_number}"
+                    load_imbalance_tracker[key] = imbalance_ratio.detach()
 
         return probs, routing_map
 

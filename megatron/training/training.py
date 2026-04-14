@@ -141,7 +141,7 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker, get_moe_metrics_tracker
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
@@ -196,6 +196,7 @@ from . import ft_integration
 stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+import matplotlib.pyplot as plt
 
 
 def destroy_global_state():
@@ -1991,6 +1992,21 @@ def training_log(
             pg_collection=pg_collection,
         )
 
+        # log moe layer related metrics
+        load_imbalance_tracker, expert_path_tracker = get_moe_metrics_tracker()
+        if wandb_writer:
+            wandb_writer.log(load_imbalance_tracker, iteration)
+        if wandb_writer and iteration % 100 == 0:
+            plt.figure(figsize=(16, 9))
+            plt.imshow(
+                expert_path_tracker["expert_path"], 
+                cmap='hot', 
+                interpolation='nearest'
+            )
+            plt.colorbar(label='Value Intensity', orientation='horizontal')
+            wandb_writer.log({"expert_path_heatmap": plt}, iteration)
+            # expert_path_tracker["expert_path"].zero_()
+
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
@@ -2021,7 +2037,9 @@ def training_log(
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
-        throughput = num_floating_point_operations(args, batch_size) / (
+        flops = num_floating_point_operations(args, batch_size)
+        total_flops = (flops) * iteration
+        throughput = flops / (
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
 
@@ -2063,6 +2081,7 @@ def training_log(
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
                 if wandb_writer:
+                    wandb_writer.log({'flops': total_flops}, iteration)
                     wandb_writer.log({'throughput': throughput}, iteration)
                     wandb_writer.log({
                         'iteration-time': elapsed_time_per_iteration,

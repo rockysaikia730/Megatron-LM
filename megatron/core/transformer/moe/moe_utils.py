@@ -42,6 +42,16 @@ except ImportError:
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 
+_moe_load_imbalance_tracker = {}
+_moe_expert_path_tracker = {}
+def get_moe_metrics_tracker():
+    return _moe_load_imbalance_tracker, _moe_expert_path_tracker
+
+def clear_moe_metrics_tracker():
+    _moe_load_imbalance_tracker.clear()
+    _moe_expert_path_tracker.clear()
+
+
 
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,

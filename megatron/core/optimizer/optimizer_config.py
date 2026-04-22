@@ -256,6 +256,9 @@ class OptimizerConfig:
     """Momentum factor for SGD optimizer."""
 
     # Muon.
+    router_weight_adam: bool = False
+    """Use Adam optimizer for MoE router weights when muon is used."""
+    
     # TODO: move muon configs to it's own `MuonConfig`.
     muon_momentum: float = 0.95
     """The momentum used by the internal SGD."""

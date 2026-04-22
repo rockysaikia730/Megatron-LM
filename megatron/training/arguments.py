@@ -1835,6 +1835,8 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+    group.add_argument('--router-weight-adam', action='store_true',
+                       help='Use Adam optimizer for MoE router weights when muon is used.')
     group.add_argument('--muon-momentum', type=float, default=0.9,
                        help='Momentum factor for Muon optimizer')
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
@@ -1843,7 +1845,7 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-use-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
-                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling', 'moonlight'],
                        help='Scale mode for Muon optimizer')
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],

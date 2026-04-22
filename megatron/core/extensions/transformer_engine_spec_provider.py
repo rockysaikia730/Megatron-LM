@@ -18,7 +18,7 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP, OffloadingExpertsMLP
 from megatron.core.utils import get_te_version, is_te_min_version
 
 
@@ -59,7 +59,8 @@ class TESpecProvider(BackendSpecProvider):
         return TEDotProductAttention
 
     def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
+        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool,
+        moe_use_offloading_experts: bool = False,
     ) -> Tuple[type, Optional[MLPSubmodules]]:
         """Which module and submodules to use for grouped mlp"""
         if (
@@ -75,6 +76,8 @@ class TESpecProvider(BackendSpecProvider):
                 'The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. '
                 'Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP.'
             )
+            if moe_use_offloading_experts:
+                return OffloadingExpertsMLP, None
             return GroupedMLP, None
         else:
             if not is_te_min_version("1.7.0.dev0"):

@@ -7,7 +7,7 @@ from typing import Optional, Protocol, Tuple
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP
+from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, OffloadingExpertsMLP
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
 try:
@@ -71,7 +71,8 @@ class BackendSpecProvider(Protocol):
 
     @abstractmethod
     def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
+        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool,
+        moe_use_offloading_experts: bool = False,
     ) -> Tuple[type, Optional[MLPSubmodules]]:
         """Which module and submodules to use for grouped mlp"""
         ...
@@ -115,7 +116,8 @@ class LocalSpecProvider(BackendSpecProvider):
         return DotProductAttention
 
     def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
+        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool,
+        moe_use_offloading_experts: bool = False,
     ) -> Tuple[type, Optional[MLPSubmodules]]:
         """Which module and submodules to use for grouped mlp"""
         if moe_use_grouped_gemm:
@@ -123,6 +125,8 @@ class LocalSpecProvider(BackendSpecProvider):
                 "The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. "
                 "Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP."
             )
+            if moe_use_offloading_experts:
+                return OffloadingExpertsMLP, None
             return GroupedMLP, None
         else:
             return SequentialMLP, MLPSubmodules(

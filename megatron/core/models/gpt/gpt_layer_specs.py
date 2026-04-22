@@ -171,6 +171,7 @@ def get_gpt_layer_with_inference_spec(
 def get_gpt_layer_with_transformer_engine_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
+    moe_use_offloading_experts: bool = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
@@ -226,6 +227,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        moe_use_offloading_experts=moe_use_offloading_experts,
         use_te_op_fuser=use_te_op_fuser,
         use_te_activation_func=use_te_activation_func,
     )
@@ -306,6 +308,7 @@ def get_gpt_layer_with_transformer_engine_spec(
 def get_gpt_layer_local_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
+    moe_use_offloading_experts: bool = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
@@ -361,6 +364,7 @@ def get_gpt_layer_local_spec(
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        moe_use_offloading_experts=moe_use_offloading_experts,
     )
 
     if multi_latent_attention:
@@ -481,6 +485,7 @@ def get_mlp_module_spec_for_backend(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    moe_use_offloading_experts: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_te_activation_func: bool = False,
 ) -> ModuleSpec:
@@ -511,6 +516,7 @@ def get_mlp_module_spec_for_backend(
             moe_grouped_gemm=moe_grouped_gemm,
             moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
             use_te_activation_func=use_te_activation_func,
+            moe_use_offloading_experts=moe_use_offloading_experts,
         )
 
 
@@ -543,6 +549,7 @@ def get_gpt_decoder_layer_specs(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+            moe_use_offloading_experts=config.moe_use_offloading_experts,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
@@ -569,6 +576,7 @@ def get_gpt_decoder_layer_specs(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+            moe_use_offloading_experts=config.moe_use_offloading_experts,
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,

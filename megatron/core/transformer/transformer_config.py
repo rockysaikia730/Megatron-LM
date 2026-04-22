@@ -660,7 +660,21 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_use_custom_function: bool = False
 
+    moe_split_expert_weights: bool = False
+
     moe_mock_router: bool = False
+
+    moe_use_offloading_experts: bool = False
+    """Whether to use offloading experts for MoE."""
+
+    moe_offloading_num_chunks: int = 8
+    """Number of chunks to split the expert weights into for offloading. """
+
+    moe_offloading_num_stages: int = 2
+    """Number of pipeline stages to for loading and computation"""
+
+    moe_offloading_chunk_size: int = -1
+    """Chunk size for offloading. If set to a positive value, it will override the chunk size calculated"""
 
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.

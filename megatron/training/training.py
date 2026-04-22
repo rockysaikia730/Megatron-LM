@@ -865,6 +865,16 @@ def pretrain(
     # Track E2E metrics on pretrain start
     one_logger_utils.on_pretrain_start()
 
+    # Print model parallel ranks.
+    global_rank = torch.distributed.get_rank()                         
+    tp  = mpu.get_tensor_model_parallel_rank()                         
+    ep  = mpu.get_expert_model_parallel_rank()                         
+    dp  = mpu.get_data_parallel_rank(with_context_parallel=False)
+    edp = mpu.get_expert_data_parallel_rank() if hasattr(mpu,          
+    "get_expert_data_parallel_rank") else None                         
+    pp  = mpu.get_pipeline_model_parallel_rank()
+    print(f"[rank={global_rank}] tp={tp} ep={ep} dp={dp} edp={edp} pp={pp}", flush=True)
+
     # Context used for persisting some state between checkpoint saves.
     if args.non_persistent_ckpt_type == 'local':
         try:
@@ -1252,6 +1262,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
     if (
+        not args.moe_use_offloading_experts and
         not (args.use_torch_fsdp2 and args.use_cpu_initialization)
         and not args.init_model_with_meta_device
     ):
@@ -1998,10 +2009,14 @@ def training_log(
             wandb_writer.log(load_imbalance_tracker, iteration)
         if wandb_writer and iteration % 100 == 0:
             plt.figure(figsize=(16, 9))
+            _ep_matrix = expert_path_tracker["expert_path"]
+            _ep_vmax = _ep_matrix.float().mean().item() * 2
             plt.imshow(
-                expert_path_tracker["expert_path"], 
-                cmap='hot', 
-                interpolation='nearest'
+                _ep_matrix,
+                cmap='viridis',
+                interpolation='nearest',
+                vmin=0,
+                vmax=_ep_vmax,
             )
             plt.colorbar(label='Value Intensity', orientation='horizontal')
             wandb_writer.log({"expert_path_heatmap": plt}, iteration)

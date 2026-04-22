@@ -358,7 +358,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 param_range = gbuf_range["param_map"][model_param]["param"]
 
                 # fp16, bf16 params.
-                if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor', 'torch.BFloat16Tensor']:
 
                     # Generate sharded model param.
                     if is_float8tensor(model_param) and config.fp8_recipe != "delayed":
@@ -396,7 +396,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     param_range.start : param_range.end
                                 ]
                         else:
-                            shard_main_param = shard_model_param.clone().float()
+                            if model_param.type() == 'torch.BFloat16Tensor':
+                                # NOTE: torch.BFloat16Tensor is a CPU tensor, 
+                                # but for now we keep main_param on GPU
+                                shard_main_param = shard_model_param.clone().to(torch.cuda.current_device()).float()
+                            else:
+                                shard_main_param = shard_model_param.clone().float()
 
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
@@ -2479,7 +2484,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # FP8 params are quantized in the above "quantize_param_shard" function.
                         continue
                     else:
-                        shard_model_param.data.copy_(shard_main_param)
+                        if shard_model_param.device == "cpu" or shard_model_param.device == torch.device("cpu"):
+                            # NOTE: this branch takes the same logic for gpu param. In case of future change,
+                            # I keep this cpu branch separate for better readability.
+                            shard_model_param.data.copy_(shard_main_param)
+                        else:
+                            shard_model_param.data.copy_(shard_main_param)
 
         # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)

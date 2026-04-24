@@ -1169,6 +1169,11 @@ def validate_args(args, defaults={}):
             args.no_load_rng = True
             warn_rank_0('enabling --no-load-rng for upcycling.')
 
+    # MoE expert offloading check
+    if args.moe_use_offloading_experts:
+        assert args.gradient_accumulation_fusion, "MoE expert offloading currently requires gradient accumulation fusion to be enabled."
+        assert not args.async_save, "Asynchronous checkpoint saving is not supported with MoE expert offloading for now."
+
     # --skip-train checks.
     if args.skip_train and not args.no_load_optim:
         args.no_load_optim = True

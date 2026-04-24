@@ -1102,8 +1102,10 @@ class OffloadingExpertsMLP(MegatronModule):
         # use pg_collection.expt_dp_group as data parallel group in this module.
         self.dp_group = pg_collection.expt_dp
         # How many feature each rank holds for fc1 and fc2, respectively.
-        tp_size = self.tp_group.size()
-        tp_rank = self.tp_group.rank()
+        etp_size = self.tp_group.size()
+        etp_rank = self.tp_group.rank()
+
+        assert etp_size == 1, "Expert-Tensor parallelism is not supported in OffloadingExpertsMLP"
         self.expert_parallel = config.expert_model_parallel_size > 1
         
         self.input_size = self.config.hidden_size \
@@ -1111,9 +1113,9 @@ class OffloadingExpertsMLP(MegatronModule):
             else self.config.moe_latent_size
         
         fc1_output_size = self.config.moe_ffn_hidden_size * (2 if self.config.gated_linear_unit else 1)
-        fc1_output_size_per_partition = divide(fc1_output_size, tp_size)
+        fc1_output_size_per_partition = divide(fc1_output_size, etp_size)
         fc2_input_size = self.config.moe_ffn_hidden_size
-        fc2_input_size_per_partition = divide(fc2_input_size, tp_size)
+        fc2_input_size_per_partition = divide(fc2_input_size, etp_size)
         
         # For now all expert weights are offloaded in CPU.
         self.weight1 = []
@@ -1156,8 +1158,8 @@ class OffloadingExpertsMLP(MegatronModule):
                     partition_dim=1,
                     init_method=config.init_method,
                     params_dtype=config.params_dtype,
-                    rank=tp_rank,
-                    world_size=tp_size,
+                    rank=etp_rank,
+                    world_size=etp_size,
                 )
                 _initialize_affine_weight_cpu(
                     self.weight2[i], 
@@ -1167,8 +1169,8 @@ class OffloadingExpertsMLP(MegatronModule):
                     partition_dim=0,
                     init_method=config.output_layer_init_method,
                     params_dtype=config.params_dtype,
-                    rank=tp_rank,
-                    world_size=tp_size,
+                    rank=etp_rank,
+                    world_size=etp_size,
                 )
             setattr(self.weight1[i], 'allreduce', not self.expert_parallel)
             setattr(self.weight2[i], 'allreduce', not self.expert_parallel)
@@ -1240,6 +1242,42 @@ class OffloadingExpertsMLP(MegatronModule):
                 self.config,
             )
             return output, None
+        
+    def backward_dw(self):
+        raise NotImplementedError("backward_dw is not implemented in OffloadingExpertsMLP for now")
+    
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        metadata = ensure_metadata_has_dp_cp_group(metadata)                                             
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)                   
+        assert self.tp_group.size() == 1, "OffloadingExpertsMLP assumes ETP size == 1"
+                                                                                                        
+        num_global_experts = self.ep_group.size() * self.num_local_experts                               
+        local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts                      
+        ep_axis = len(sharded_offsets)                                                                   
+        replica_id = (0, 0, self.dp_group.rank())
+                                                                                                        
+        sharded_state_dict = {}
+        for i in range(self.num_local_experts):
+            g_idx = local_expert_indices_offset + i
+            w1 = getattr(self, f'weight1_expert_{i}')
+            w2 = getattr(self, f'weight2_expert_{i}')
+
+            if singleton_local_shards:
+                w1_key = f'{prefix}experts.{g_idx}.weight1'
+                w2_key = f'{prefix}experts.{g_idx}.weight2'                                        
+                offsets = sharded_offsets                                                          
+            else:
+                w1_key = f'{prefix}experts.weight1'                                                
+                w2_key = f'{prefix}experts.weight2'
+                offsets = (*sharded_offsets, (ep_axis, g_idx, num_global_experts))                 
+
+            sharded_state_dict[f'{prefix}weight1_expert_{i}'] = ShardedTensor.from_rank_offsets(   
+                w1_key, w1, *offsets, replica_id=replica_id,                                       
+            )
+            sharded_state_dict[f'{prefix}weight2_expert_{i}'] = ShardedTensor.from_rank_offsets(
+                w2_key, w2, *offsets, replica_id=replica_id,                                       
+            )
+        return sharded_state_dict
 
 
 

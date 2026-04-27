@@ -1134,6 +1134,7 @@ class OffloadingExpertsMLP(MegatronModule):
                 ),
             )
             self.weight1.append(getattr(self, f'weight1_expert_{i}'))
+            self.weight1[i].skip_backward_post_hook = True
 
             self.register_parameter(
                 f'weight2_expert_{i}',
@@ -1148,6 +1149,7 @@ class OffloadingExpertsMLP(MegatronModule):
                 ),
             )
             self.weight2.append(getattr(self, f'weight2_expert_{i}'))
+            self.weight2[i].skip_backward_post_hook = True
 
             if config.perform_initialization:
                 _initialize_affine_weight_cpu(
@@ -1201,6 +1203,8 @@ class OffloadingExpertsMLP(MegatronModule):
         # scheduler to determine when to trigger wgrad compute
         self.expert_wgrad_scheduler = ExpertsWgradScheduler(config.delay_wgrad_compute)
 
+        # store hooks after wgrad reduce
+        self.wgrad_accumulation_and_reduce_hooks = []
     
     def forward(
         self,
@@ -1221,6 +1225,7 @@ class OffloadingExpertsMLP(MegatronModule):
                 self.expert_wgrad_scheduler,
                 self.stream_manager,
                 self.config,
+                self.wgrad_accumulation_and_reduce_hooks,
             )
 
             return output, None
@@ -1240,11 +1245,15 @@ class OffloadingExpertsMLP(MegatronModule):
                 self.expert_wgrad_scheduler,
                 self.stream_manager,
                 self.config,
+                self.wgrad_accumulation_and_reduce_hooks,
             )
             return output, None
         
     def backward_dw(self):
         raise NotImplementedError("backward_dw is not implemented in OffloadingExpertsMLP for now")
+    
+    def register_wgrad_accumulation_and_reduce_hooks(self, hook_fn):
+        self.wgrad_accumulation_and_reduce_hooks.append(hook_fn)
     
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         metadata = ensure_metadata_has_dp_cp_group(metadata)                                             

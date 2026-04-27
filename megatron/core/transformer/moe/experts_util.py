@@ -516,7 +516,6 @@ class GroupedSwiMLP(torch.autograd.Function):
         y, _ = GroupedSwiMLP.call_forward_y(
             w2, a, tokens_per_expert, permuted_probs
         )
-        print(y)
 
         # context saving
         ctx.expert_wgrad_scheduler = expert_wgrad_scheduler

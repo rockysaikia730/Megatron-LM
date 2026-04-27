@@ -19,7 +19,7 @@ try:
 except ImportError:
     grouped_gemm = None
 
-from megatron.core.transformer.moe.experts_util import ExpertsWgradScheduler, MergedSwiGLU
+from megatron.core.transformer.moe.experts_util import ExpertsWgradScheduler, MergedSwiGLU, release
 
 
 class StreamManager:
@@ -314,12 +314,12 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
         fuse_gradient_accumulation: bool,
     ):
         # handle ddp
+        assert fuse_gradient_accumulation, \
+            "Only support fuse_gradient_accumulation for offloading experts."
         for i in range(len(w)):
             if fuse_gradient_accumulation:
                 w[i].grad_added_to_main_grad = True
-            else:
-                w[i].grad_added_to_main_grad = False
-                w[i].grad = wgrad_output[i].view(w[i].shape)
+                w[i].grad = torch.empty_like(w[i].data)
     
     @classmethod
     def call_backward_grad_w2(
@@ -471,18 +471,19 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
         if len(args) < 9:
             raise ValueError(f"Insufficient arguments for forward pass of GroupedSwiMLP. Expected at least 9, got {len(args)}")
         
-        cpu_weights: list[torch.nn.Parameter] = args[:-9]
+        cpu_weights: list[torch.nn.Parameter] = args[:-10]
         cpu_w1: list[torch.nn.Parameter] = cpu_weights[:len(cpu_weights)//2]
         cpu_w2: list[torch.nn.Parameter] = cpu_weights[len(cpu_weights)//2:]
-        gpu_w1_buffers: list[torch.Tensor] = args[-9]
-        gpu_w2_buffers: list[torch.Tensor] = args[-8]
-        permuted_local_hidden_states: torch.Tensor = args[-7]
-        tokens_per_expert: torch.Tensor = args[-6]
-        num_local_experts: int = args[-5]
-        permuted_probs: torch.Tensor = args[-4]
-        expert_wgrad_scheduler: ExpertsWgradScheduler = args[-3]
-        stream_manager: StreamManager = args[-2]
-        config: TransformerConfig = args[-1]
+        gpu_w1_buffers: list[torch.Tensor] = args[-10]
+        gpu_w2_buffers: list[torch.Tensor] = args[-9]
+        permuted_local_hidden_states: torch.Tensor = args[-8]
+        tokens_per_expert: torch.Tensor = args[-7]
+        num_local_experts: int = args[-6]
+        permuted_probs: torch.Tensor = args[-5]
+        expert_wgrad_scheduler: ExpertsWgradScheduler = args[-4]
+        stream_manager: StreamManager = args[-3]
+        config: TransformerConfig = args[-2]
+        wgrad_accumulation_and_reduce_hooks: list = args[-1]
 
         # split hidden states, outputs and token_per_experts into chunks for each expert chunks
         tokens_per_expert_chunks = torch.split(tokens_per_expert, config.moe_offloading_chunk_size)
@@ -515,6 +516,8 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
         )
 
         # context saving for backward
+        ctx.wgrad_accumulation_and_reduce_hooks = wgrad_accumulation_and_reduce_hooks
+        ctx.tokens_per_expert = tokens_per_expert
         ctx.tokens_per_expert_chunks = tokens_per_expert_chunks
         ctx.total_token_num_per_chunk = total_token_num_per_chunk
         ctx.expert_wgrad_scheduler = expert_wgrad_scheduler
@@ -524,10 +527,66 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
         ctx.gpu_w2_buffers = gpu_w2_buffers
         ctx.stream_manager = stream_manager
         ctx.config = config
-        ctx.save_for_backward(permuted_local_hidden_states, fc1_output, tokens_per_expert, permuted_probs)
 
-        # TODO: for now activation recomputation and activation quantization are not supported
+        activation_recompute = (
+            config.recompute_granularity == 'selective'
+            and "moe_act" in config.recompute_modules
+        )
+        ctx.activation_recompute = activation_recompute
+        if config.fp8_activation:
+            if HAVE_TE:
+                quantizer = Float8BlockQuantizer(
+                    fp8_dtype=TE_DType[torch.float8_e4m3fn],
+                    rowwise=True,
+                    columnwise=False,
+                    amax_epsilon=0.0,
+                    force_pow_2_scales=True,
+                    block_scaling_dim=1,
+                )
+                qx = quantizer.make_empty(
+                    permuted_local_hidden_states.shape, 
+                    dtype=permuted_local_hidden_states.dtype, 
+                    device=permuted_local_hidden_states.device, 
+                    requires_grad=False
+                )
+                qx = quantizer.update_quantized(
+                    permuted_local_hidden_states, qx
+                )
+                release(permuted_local_hidden_states)
 
+                if activation_recompute:
+                    ctx.qx = qx
+                    ctx.qa = None
+                    ctx.save_for_backward(
+                        None, None, permuted_probs
+                    )
+                    release(fc1_output)
+                else:
+                    qa = quantizer.make_empty(
+                        fc1_output.shape, 
+                        dtype=fc1_output.dtype, 
+                        device=fc1_output.device, 
+                        requires_grad=False
+                    )
+                    qa = quantizer.update_quantized(
+                        fc1_output, qa
+                    )
+                    ctx.qx = qx
+                    ctx.qa = qa
+                    ctx.save_for_backward(
+                        None, None, permuted_probs
+                    )
+                    release(fc1_output)
+        else:
+            if activation_recompute:
+                ctx.save_for_backward(
+                    permuted_local_hidden_states, None, permuted_probs
+                )
+                release(fc1_output)
+            else:
+                ctx.save_for_backward(
+                    permuted_local_hidden_states, fc1_output, permuted_probs
+                )
         return y, None
 
 
@@ -545,7 +604,42 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
         expert_wgrad_scheduler: ExpertsWgradScheduler = ctx.expert_wgrad_scheduler
         total_token_num_per_chunk: list[int] = ctx.total_token_num_per_chunk
         tokens_per_expert_chunks: tuple[torch.Tensor] = ctx.tokens_per_expert_chunks
-        permuted_local_hidden_states, fc1_output, tokens_per_expert, permuted_probs = ctx.saved_tensors
+        tokens_per_expert: torch.Tensor = ctx.tokens_per_expert
+        (permuted_local_hidden_states, fc1_output, permuted_probs) = ctx.saved_tensors
+
+        # rematerialize activation if needed
+        # NOTE: fp8 tensors have to be manually released after dequantization
+        if config.fp8_activation:
+            permuted_local_hidden_states = ctx.qx.dequantize()
+            hidden_state_per_chunk = list(torch.split(permuted_local_hidden_states, total_token_num_per_chunk))
+            release(ctx.qx)
+            if not ctx.activation_recompute:
+                fc1_output = ctx.qa.dequantize()
+                release(ctx.qa)
+            else:
+                fc1_output = OffloadingExpertsGroupedSwiMLP.call_forward_a(
+                    cpu_w1,
+                    gpu_w1_buffers,
+                    permuted_local_hidden_states,
+                    hidden_state_per_chunk,
+                    total_token_num_per_chunk,
+                    tokens_per_expert_chunks,
+                    stream_manager,
+                    config,
+                )
+        else:
+            hidden_state_per_chunk = list(torch.split(permuted_local_hidden_states, total_token_num_per_chunk))
+            if ctx.activation_recompute:
+                fc1_output = OffloadingExpertsGroupedSwiMLP.call_forward_a(
+                    cpu_w1,
+                    gpu_w1_buffers,
+                    permuted_local_hidden_states,
+                    hidden_state_per_chunk,
+                    total_token_num_per_chunk,
+                    tokens_per_expert_chunks,
+                    stream_manager,
+                    config,
+                )
 
         grad_y = grad_outputs[0].contiguous()
 
@@ -596,12 +690,19 @@ class OffloadingExpertsGroupedSwiMLP(torch.autograd.Function):
             config.gradient_accumulation_fusion,
         )
 
-        # NOTE: for weights on CPU, gradients are directly accumulated into main_grad
-        # to avoid graph breaking
+        # NOTE: gradients have been attached in _wgrad_post_process, 
+        # so we can return None for grad_w1 and grad_w2
         grad_w1_ret = [None for _ in cpu_w1]
         grad_w2_ret = [None for _ in cpu_w2]
 
-        return *grad_w1_ret, *grad_w2_ret, None, None, grad_x, None, None, grad_probs, None, None, None
+        # NOTE: manually trigger wgrad accumulation hook
+        # this is needed as the hook may fail to be triggered if 
+        # the parameter is on CPU, and hence cause hanging when
+        # overlap_grad_reduce is enabled
+        for hook_fn in ctx.wgrad_accumulation_and_reduce_hooks:
+            hook_fn()
+
+        return *grad_w1_ret, *grad_w2_ret, None, None, grad_x, None, None, grad_probs, None, None, None, None
 
 
 
@@ -618,6 +719,7 @@ def offloading_grouped_swiglu_mlp(
     expert_wgrad_scheduler: ExpertsWgradScheduler,
     stream_manager: StreamManager,
     config: TransformerConfig,
+    wgrad_accumulation_and_reduce_hooks: list,
 ) -> torch.Tensor:
     """Autograd function for Offloading Experts Grouped SwiGLU MLP.
 
@@ -649,6 +751,7 @@ def offloading_grouped_swiglu_mlp(
         expert_wgrad_scheduler,
         stream_manager,
         config,
+        wgrad_accumulation_and_reduce_hooks
     )
 
     return output

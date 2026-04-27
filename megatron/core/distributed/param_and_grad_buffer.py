@@ -146,8 +146,10 @@ class _ParamAndGradBucketGroup:
         # responsible for, param_to_bucket maps params to the corresponding bucket.
         self.param_to_bucket = {}
         self.params = set()
+        self.is_expert_param_on_cpu = True
         for bucket in self.buckets:
             for param in bucket.params_list:
+                self.is_expert_param_on_cpu = self.is_expert_param_on_cpu and (param.device == torch.device("cpu"))
                 self.param_to_bucket[param] = bucket
                 self.params.add(param)
 
@@ -293,62 +295,74 @@ class _ParamAndGradBucketGroup:
                         async_op=async_op,
                     )
 
-        
-        # if bucket.param_data.device == torch.device("cpu"):                                                                                                                                                          
-        #     gpu_param = torch.empty_like(bucket.param_data, device=torch.cuda.current_device())
-        #     gpu_local = local_data_view.to(torch.cuda.current_device(), non_blocking=False)                                                                                                                                                
-        #     torch.distributed.all_gather_into_tensor(
-        #         gpu_param, 
-        #         gpu_local, 
-        #         group=self.intra_distributed_optimizer_instance_group
-        #     )  # sync                                                                                                                        
-        #     bucket.param_data.copy_(gpu_param, non_blocking=False)
-        #     gpu_param.data.storage().resize_(0)
-        #     gpu_local.data.storage().resize_(0)
-        #     del gpu_param, gpu_local
-        
         # handle CPU buckets outside the coalescing manager   
-        # NOTE: to aoivd large GPU memory consumption we take
-        # a chunked all-gather approach for CPU buckets 
-        # TODO: optimize this logic                                                                                                                                                  
-        for idx, bucket in enumerate(self.buckets):
-            if self.cached_param_buffer_shard_list[idx] is None:
-                self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                    bucket.param_data, self.intra_distributed_optimizer_instance_size
-                )
-            local_data_view = self.cached_param_buffer_shard_list[idx][
-                self.intra_distributed_optimizer_instance_rank
-            ]                                                                                                                                                                
-            if bucket.param_data.device == torch.device("cpu"):
-                world = self.intra_distributed_optimizer_instance_size
-                shard_numel = local_data_view.numel()
-                # chunk = 1/4 of the per-rank shard -> 4 iterations, ~4x lower peak GPU
-                num_chunks = 4
-                chunk_shard = (shard_numel + num_chunks - 1) // num_chunks
-                device = torch.cuda.current_device()
-                dtype = bucket.param_data.dtype
+        # NOTE: when overlap is disabled, to aoivd large GPU memory consumption we take
+        # a chunked all-gather approach for CPU buckets. 
+        # When overlap is enabled, As all device hold the buckets
+        # in the same order, it should be safe to launch sync all-gather by order
 
-                gs_buf = torch.empty(chunk_shard, dtype=dtype, device=device)
-                gf_buf = torch.empty(chunk_shard * world, dtype=dtype, device=device)
-
-                flat_cpu = bucket.param_data.view(-1)
-                local_flat = local_data_view.contiguous().view(-1)
-
-                for off in range(0, shard_numel, chunk_shard):
-                    n = min(chunk_shard, shard_numel - off)
-                    gs = gs_buf[:n]
-                    gf = gf_buf[: n * world]
-                    gs.copy_(local_flat[off : off + n], non_blocking=False)
+        if self.ddp_config.overlap_grad_reduce:
+            for idx, bucket in enumerate(self.buckets):
+                if self.cached_param_buffer_shard_list[idx] is None:
+                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                        bucket.param_data, self.intra_distributed_optimizer_instance_size
+                    )
+                local_data_view = self.cached_param_buffer_shard_list[idx][
+                    self.intra_distributed_optimizer_instance_rank
+                ]              
+                if bucket.param_data.device == torch.device("cpu"):
+                    gpu_param = torch.empty_like(bucket.param_data, device=torch.cuda.current_device())
+                    gpu_local = local_data_view.to(torch.cuda.current_device(), non_blocking=False)
                     torch.distributed.all_gather_into_tensor(
-                        gf,
-                        gs,
-                        group=self.intra_distributed_optimizer_instance_group,
+                        gpu_param, 
+                        gpu_local, 
+                        group=self.intra_distributed_optimizer_instance_group
                     )  # sync
-                    gf_view = gf.view(world, n)
-                    for r in range(world):
-                        dst = r * shard_numel + off
-                        flat_cpu[dst : dst + n].copy_(gf_view[r], non_blocking=False)
-                del gs_buf, gf_buf
+                    bucket.param_data.copy_(gpu_param, non_blocking=False)
+                    gpu_param.data.storage().resize_(0)
+                    gpu_local.data.storage().resize_(0)
+                    del gpu_param, gpu_local
+        else:
+            for idx, bucket in enumerate(self.buckets):
+                if self.cached_param_buffer_shard_list[idx] is None:
+                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                        bucket.param_data, self.intra_distributed_optimizer_instance_size
+                    )
+                local_data_view = self.cached_param_buffer_shard_list[idx][
+                    self.intra_distributed_optimizer_instance_rank
+                ]                                                                                                                                                                
+                if bucket.param_data.device == torch.device("cpu"):
+                    world = self.intra_distributed_optimizer_instance_size
+                    shard_numel = local_data_view.numel()
+                    # chunk = 1/8 of the per-rank shard -> 8 iterations, ~8x lower peak GPU memory usage
+                    num_chunks = 8
+                    chunk_shard = (shard_numel + num_chunks - 1) // num_chunks
+                    device = torch.cuda.current_device()
+                    dtype = bucket.param_data.dtype
+
+                    gs_buf = torch.empty(chunk_shard, dtype=dtype, device=device)
+                    gf_buf = torch.empty(chunk_shard * world, dtype=dtype, device=device)
+
+                    flat_cpu = bucket.param_data.view(-1)
+                    local_flat = local_data_view.contiguous().view(-1)
+
+                    for off in range(0, shard_numel, chunk_shard):
+                        n = min(chunk_shard, shard_numel - off)
+                        gs = gs_buf[:n]
+                        gf = gf_buf[: n * world]
+                        gs.copy_(local_flat[off : off + n], non_blocking=False)
+                        torch.distributed.all_gather_into_tensor(
+                            gf,
+                            gs,
+                            group=self.intra_distributed_optimizer_instance_group,
+                        )  # sync
+                        gf_view = gf.view(world, n)
+                        for r in range(world):
+                            dst = r * shard_numel + off
+                            flat_cpu[dst : dst + n].copy_(gf_view[r], non_blocking=False)
+                    gs_buf.data.storage().resize_(0)
+                    gf_buf.data.storage().resize_(0)
+                    del gs_buf, gf_buf
 
         if async_op:
             self.param_gather_handle = cm

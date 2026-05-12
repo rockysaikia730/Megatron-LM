@@ -1918,6 +1918,21 @@ def _add_network_size_args(parser):
                        'We compute the average of the MTP losses across all depths, '
                        'and multiply it the scaling factor to obtain the overall MTP loss, '
                        'which serves as an additional training objective.')
+    group.add_argument('--enable-multi-codebook-heads', action='store_true',
+                       help='Enable parallel multi-codebook output heads for RVQ-based '
+                       'audio token prediction (e.g., HCodec-1.0). When enabled, K audio '
+                       'heads are added alongside the text output head; the model becomes '
+                       'a multi-modal decoder. Backward compatible: when off, model '
+                       'behavior is unchanged.')
+    group.add_argument('--num-audio-codebooks', type=int, default=4,
+                       help='Number of RVQ audio codebooks (K) when '
+                       '--enable-multi-codebook-heads is set. Default 4 (HCodec-1.0).')
+    group.add_argument('--audio-codebook-size', type=int, default=1024,
+                       help='Per-codebook audio vocabulary size (V_a) when '
+                       '--enable-multi-codebook-heads is set. Default 1024 (HCodec-1.0).')
+    group.add_argument('--audio-loss-weight', type=float, default=1.0,
+                       help='Weight (lambda) applied to the audio loss term in the '
+                       'total loss: L = L_text + lambda * mean_k(L_audio_k). Default 1.0.')
     group.add_argument('--moe-latent-size', type=int, default=None,
                        help='Latent projection dimension for MoE. If None, MoE latent projections are not used.')
 

@@ -12,6 +12,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.gpt.multi_codebook_head import MultiCodebookOutputHead
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
     RotaryEmbedding,
@@ -249,6 +250,17 @@ class GPTModel(LanguageModule):
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.pg_collection.tp,
             )
+
+            if getattr(self.config, 'enable_multi_codebook_heads', False):
+                self.audio_output_heads = MultiCodebookOutputHead(
+                    config=self.config,
+                    num_codebooks=self.config.num_audio_codebooks,
+                    codebook_vocab_size=self.config.audio_codebook_size,
+                    parallel_output=self.parallel_output,
+                    pg_collection=self.pg_collection,
+                )
+            else:
+                self.audio_output_heads = None
 
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
@@ -647,6 +659,17 @@ class GPTModel(LanguageModule):
                 }
             )
             log_config_to_disk(self.config, payload, prefix='input_and_logits')
+
+        if self.audio_output_heads is not None:
+            # Multi-codebook mode: compute K parallel audio heads alongside the
+            # text head. Return a dict of logits (both keys in [B, S, ...]
+            # layout). In-model loss is bypassed so the training script's
+            # loss_func can handle K+1 cross-entropies with per-head masks.
+            audio_logits = self.audio_output_heads(hidden_states)
+            return {
+                "text": logits.transpose(0, 1).contiguous(),
+                "audio": audio_logits.transpose(0, 1).contiguous(),
+            }
 
         if labels is None:
             # [s b h] => [b s h]

@@ -11,6 +11,7 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
+from megatron.core import tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
@@ -309,7 +310,86 @@ def apply_decay_modality_weights(loss_mask: torch.Tensor, labels: torch.Tensor, 
     return loss_mask
 
 
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None, labels: torch.Tensor = None, current_modality_weights: dict = None):
+def _vocab_parallel_ce_bs(logits_bs: torch.Tensor, labels_bs: torch.Tensor) -> torch.Tensor:
+    """Run vocab_parallel_cross_entropy on [B, S, ...] tensors.
+
+    The Megatron CE expects seq-first logits [S, B, V/TP] and targets [S, B].
+    This helper does the transpose round-trip so callers can stay in [B, S, ...]
+    layout. Returns per-token loss [B, S].
+    """
+    logits_sb = logits_bs.transpose(0, 1).contiguous()
+    labels_sb = labels_bs.transpose(0, 1).contiguous()
+    loss_sb = tensor_parallel.vocab_parallel_cross_entropy(logits_sb, labels_sb)
+    return loss_sb.transpose(0, 1).contiguous()
+
+
+def _compute_multi_codebook_loss(
+    output_dict: dict,
+    text_labels: torch.Tensor,
+    text_loss_mask: torch.Tensor,
+    audio_labels: torch.Tensor,
+    audio_loss_mask: torch.Tensor,
+    audio_loss_weight: float,
+) -> Tuple[torch.Tensor, dict]:
+    """Compute combined text + K-audio cross-entropy loss for multi-codebook mode.
+
+    Args:
+        output_dict: {"text": [B, S, V_text/TP], "audio": [B, S, K, V_a/TP]}
+            as returned by GPTModel.forward when enable_multi_codebook_heads is on.
+        text_labels: [B, S] text labels.
+        text_loss_mask: [B, S] text loss mask (1=train, 0=ignore). Modality routing
+            should already have zeroed out audio positions.
+        audio_labels: [B, S, K] audio codebook labels.
+        audio_loss_mask: [B, S, K] per-codebook audio loss mask (1=train, 0=ignore).
+            Modality routing + delay-pattern masking already applied upstream.
+        audio_loss_weight: lambda in L = L_text + lambda * mean_k(L_audio_k).
+
+    Returns:
+        combined_loss: scalar tensor used for backward.
+        report: dict of [sum, count] tensors for logging.
+    """
+    text_logits = output_dict["text"]   # [B, S, V_text/TP]
+    audio_logits = output_dict["audio"] # [B, S, K, V_a/TP]
+    num_codebooks = audio_logits.size(2)
+
+    # --- Text head ---
+    text_loss_bs = _vocab_parallel_ce_bs(text_logits, text_labels).float()
+    text_mask_f = text_loss_mask.float()
+    text_loss_sum = (text_loss_bs * text_mask_f).sum()
+    text_count = text_mask_f.sum()
+    text_avg = text_loss_sum / torch.clamp(text_count, min=1.0)
+
+    # --- K audio heads ---
+    audio_avg_per_head = []
+    per_head_metrics = []
+    for k in range(num_codebooks):
+        audio_loss_bs = _vocab_parallel_ce_bs(
+            audio_logits[:, :, k, :], audio_labels[..., k]
+        ).float()
+        audio_mask_k = audio_loss_mask[..., k].float()
+        audio_k_sum = (audio_loss_bs * audio_mask_k).sum()
+        audio_k_count = audio_mask_k.sum()
+        audio_k_avg = audio_k_sum / torch.clamp(audio_k_count, min=1.0)
+        audio_avg_per_head.append(audio_k_avg)
+        per_head_metrics.append((audio_k_sum.detach(), audio_k_count.detach()))
+
+    audio_mean = torch.stack(audio_avg_per_head).mean()
+    combined_loss = text_avg + audio_loss_weight * audio_mean
+
+    # Build report dict in [sum, count] format the framework expects.
+    one = torch.ones(1, device=combined_loss.device, dtype=combined_loss.dtype)
+    report = {
+        'lm loss': torch.cat([combined_loss.detach().view(1), one]),
+        'text loss': torch.cat([text_loss_sum.detach().view(1), text_count.detach().view(1)]),
+        'audio loss mean': torch.cat([audio_mean.detach().view(1), one]),
+    }
+    for k, (s, c) in enumerate(per_head_metrics):
+        report[f'audio loss k{k}'] = torch.cat([s.view(1), c.view(1)])
+
+    return combined_loss, report
+
+
+def loss_func(loss_mask: torch.Tensor, output_tensor, model: Optional[GPTModel] = None, labels: torch.Tensor = None, current_modality_weights: dict = None, audio_labels: torch.Tensor = None, audio_loss_mask: torch.Tensor = None):
     """Loss function.
 
     Args:
@@ -326,7 +406,27 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
     """
     args = get_args()
 
-    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+    # Multi-codebook branch: GPTModel returns a dict of logits when
+    # --enable-multi-codebook-heads is set. The combined loss is computed here
+    # rather than in the model so all K+1 cross-entropies and their masks live
+    # in one place.
+    if isinstance(output_tensor, dict):
+        assert audio_labels is not None and audio_loss_mask is not None, (
+            "audio_labels and audio_loss_mask must be provided when the model "
+            "returns multi-codebook logits"
+        )
+        loss, report = _compute_multi_codebook_loss(
+            output_tensor,
+            text_labels=labels,
+            text_loss_mask=loss_mask,
+            audio_labels=audio_labels,
+            audio_loss_mask=audio_loss_mask,
+            audio_loss_weight=args.audio_loss_weight,
+        )
+        num_tokens = torch.ones(1, dtype=torch.int, device=loss.device).squeeze()
+        losses = None  # signals the modality-token-loss section below to skip
+
+    elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
         losses = output_tensor.view(-1).float()
@@ -368,9 +468,16 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
         )
 
     # --- Per-modality token losses ---
-    # Skip when using modelopt since `losses` is not defined in that code path
+    # Skip when using modelopt or multi-codebook mode, since `losses` is not
+    # defined in those code paths (multi-codebook builds its own per-head report).
     is_modelopt = has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False)
-    if labels is not None and getattr(args, 'base_vocab_size', None) is not None and not is_modelopt:
+    is_multi_codebook = isinstance(output_tensor, dict)
+    if (
+        labels is not None
+        and getattr(args, 'base_vocab_size', None) is not None
+        and not is_modelopt
+        and not is_multi_codebook
+    ):
         losses_flat = losses.detach().reshape(-1)
         labels_flat = labels.reshape(-1)
         loss_mask_flat = loss_mask.reshape(-1)
@@ -449,6 +556,23 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     }
     loss_mask = apply_decay_modality_weights(loss_mask, labels, args, current_modality_weights)
 
+    # Stub audio labels + per-codebook loss mask when multi-codebook heads are
+    # enabled. Only generated on stages that have labels (PP=1 or PP-last) since
+    # they're only consumed by loss_func on the last pipeline stage. Real audio
+    # labels will be sourced from the HCodec-preprocessed dataset later.
+    audio_labels = None
+    audio_loss_mask = None
+    if getattr(args, 'enable_multi_codebook_heads', False) and labels is not None:
+        K = args.num_audio_codebooks
+        V_a = args.audio_codebook_size
+        B, S = labels.shape
+        audio_labels = torch.randint(
+            0, V_a, (B, S, K), device=labels.device, dtype=labels.dtype
+        )
+        audio_loss_mask = torch.ones(
+            (B, S, K), device=loss_mask.device, dtype=loss_mask.dtype
+        )
+
     with stimer:
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels,
@@ -467,6 +591,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     model=model,
                     labels=labels,
                     current_modality_weights=current_modality_weights,
+                    audio_labels=audio_labels,
+                    audio_loss_mask=audio_loss_mask,
                 )
             else:
                 output_tensor = model(
@@ -481,6 +607,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         model=model,
         labels=labels,
         current_modality_weights=current_modality_weights,
+        audio_labels=audio_labels,
+        audio_loss_mask=audio_loss_mask,
     )
 
 

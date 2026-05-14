@@ -1933,6 +1933,11 @@ def _add_network_size_args(parser):
     group.add_argument('--audio-loss-weight', type=float, default=1.0,
                        help='Weight (lambda) applied to the audio loss term in the '
                        'total loss: L = L_text + lambda * mean_k(L_audio_k). Default 1.0.')
+    group.add_argument('--audio-pad-token-id', type=int, default=None,
+                       help='Reserved audio-codebook index used as <audio_pad> in '
+                       'delay-pattern gaps. Per-codebook loss is masked at positions '
+                       'whose target equals this ID. Must be a valid index, '
+                       '0 <= id < --audio-codebook-size. None disables pad handling.')
     group.add_argument('--moe-latent-size', type=int, default=None,
                        help='Latent projection dimension for MoE. If None, MoE latent projections are not used.')
 

@@ -73,6 +73,14 @@ class TransformerConfig(ModelParallelConfig):
     L = L_text + lambda * mean_k(L_audio_k). Only used by the multi-codebook loss
     function in the training script."""
 
+    audio_pad_token_id: Optional[int] = None
+    """Reserved index in the audio codebook vocabulary used as the `<audio_pad>`
+    filler in delay-pattern gaps. When set, the data pipeline emits this index
+    at the empty slots created by the delay shift, and the per-codebook audio
+    loss mask is zeroed at positions where the target equals this index. Must
+    satisfy 0 <= audio_pad_token_id < audio_codebook_size. None disables pad
+    handling (no delay gaps in the data, or pad masking is done elsewhere)."""
+
     num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of transformer layers on first pipeline stage.
     None implies equal layer division across PP ranks."""

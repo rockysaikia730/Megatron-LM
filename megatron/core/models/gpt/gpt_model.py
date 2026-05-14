@@ -340,16 +340,23 @@ class GPTModel(LanguageModule):
                 and audio_tokens is not None
                 and modality_mask is not None
             ):
-                assert not self.config.sequence_parallel, (
-                    "Multi-codebook input embedding with --sequence-parallel is "
-                    "not yet supported; the merge happens before SP scatter. "
-                    "Run with TP=1 or disable --sequence-parallel for now."
-                )
                 # audio_emb: [B, S, H] -> transpose to [S, B, H] to match decoder_input.
                 audio_emb = self.audio_input_embedding(audio_tokens)
                 audio_emb = audio_emb.transpose(0, 1).contiguous()
                 # modality_mask: [B, S] (bool/int). Broadcast to [S, B, 1].
-                mask_sbh = modality_mask.to(torch.bool).transpose(0, 1).unsqueeze(-1)
+                mask_sbh = modality_mask.to(torch.bool).transpose(0, 1).unsqueeze(-1).contiguous()
+                # Under sequence parallel, the text embedding has already been
+                # split along the sequence dim into [S/TP, B, H]. Apply the same
+                # scatter to the audio embedding and the modality mask so all
+                # three tensors share the same rank-local sequence slice before
+                # the elementwise where().
+                if self.config.sequence_parallel:
+                    audio_emb = tensor_parallel.scatter_to_sequence_parallel_region(
+                        audio_emb, group=self.pg_collection.tp
+                    )
+                    mask_sbh = tensor_parallel.scatter_to_sequence_parallel_region(
+                        mask_sbh, group=self.pg_collection.tp
+                    )
                 decoder_input = torch.where(mask_sbh, audio_emb, decoder_input)
         else:
             # intermediate stage of pipeline

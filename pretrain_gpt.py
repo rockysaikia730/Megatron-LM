@@ -562,6 +562,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     # labels will be sourced from the HCodec-preprocessed dataset later.
     audio_labels = None
     audio_loss_mask = None
+    audio_pad_id = getattr(args, 'audio_pad_token_id', None)
     if getattr(args, 'enable_multi_codebook_heads', False) and labels is not None:
         K = args.num_audio_codebooks
         V_a = args.audio_codebook_size
@@ -572,6 +573,16 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         audio_loss_mask = torch.ones(
             (B, S, K), device=loss_mask.device, dtype=loss_mask.dtype
         )
+        # When --audio-pad-token-id is set, simulate delay-pattern pad: at every
+        # codebook layer k, force the first k positions to be pad and zero out
+        # their loss mask. Matches the leading-edge triangle of the delay shift.
+        if audio_pad_id is not None:
+            assert 0 <= audio_pad_id < V_a, (
+                f"audio_pad_token_id={audio_pad_id} must be in [0, {V_a})"
+            )
+            for k in range(1, K):
+                audio_labels[:, :k, k] = audio_pad_id
+                audio_loss_mask[:, :k, k] = 0
 
     # Stub audio input tokens + modality_mask for the multi-codebook INPUT
     # embedding (paper: 4 embedding tables, summed). Generated on stages that
@@ -587,6 +598,12 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         audio_tokens = torch.randint(
             0, V_a, (B, S, K), device=tokens.device, dtype=tokens.dtype
         )
+        # Inject the same delay-pattern pad on the INPUT side: at codebook k,
+        # the first k positions are <audio_pad>. The audio embedding tables
+        # learn a representation for the pad index just like any other token.
+        if audio_pad_id is not None:
+            for k in range(1, K):
+                audio_tokens[:, :k, k] = audio_pad_id
         modality_mask = torch.zeros((B, S), device=tokens.device, dtype=torch.bool)
         modality_mask[:, S // 2:] = True  # second half is "audio"
 

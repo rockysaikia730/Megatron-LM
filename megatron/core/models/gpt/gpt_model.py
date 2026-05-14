@@ -12,6 +12,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.gpt.multi_codebook_embedding import MultiCodebookInputEmbedding
 from megatron.core.models.gpt.multi_codebook_head import MultiCodebookOutputHead
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
@@ -153,6 +154,16 @@ class GPTModel(LanguageModule):
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
                 tp_group=self.pg_collection.tp,
             )
+
+            if getattr(self.config, 'enable_multi_codebook_heads', False):
+                self.audio_input_embedding = MultiCodebookInputEmbedding(
+                    config=self.config,
+                    num_codebooks=self.config.num_audio_codebooks,
+                    codebook_vocab_size=self.config.audio_codebook_size,
+                    pg_collection=self.pg_collection,
+                )
+            else:
+                self.audio_input_embedding = None
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = RotaryEmbedding(
@@ -297,11 +308,17 @@ class GPTModel(LanguageModule):
         decoder_input: Tensor = None,
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
+        audio_tokens: Tensor = None,
+        modality_mask: Tensor = None,
     ):
         """Preprocesses inputs for the transformer decoder.
 
         Applies embeddings to input tokens, or uses `decoder_input` from a previous
         pipeline stage. Also sets up rotary positional embeddings.
+
+        When multi-codebook input embedding is enabled and `audio_tokens` are
+        provided, audio positions (selected by `modality_mask`) replace the
+        text embedding with a sum-of-K-codebook-embedding lookup.
         """
 
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
@@ -314,6 +331,26 @@ class GPTModel(LanguageModule):
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+
+            # Multi-codebook input merge: at audio positions, replace the text
+            # embedding with the sum of K codebook embeddings. Both tensors
+            # live in [S, B, H] (Megatron's seq-first internal layout).
+            if (
+                getattr(self, 'audio_input_embedding', None) is not None
+                and audio_tokens is not None
+                and modality_mask is not None
+            ):
+                assert not self.config.sequence_parallel, (
+                    "Multi-codebook input embedding with --sequence-parallel is "
+                    "not yet supported; the merge happens before SP scatter. "
+                    "Run with TP=1 or disable --sequence-parallel for now."
+                )
+                # audio_emb: [B, S, H] -> transpose to [S, B, H] to match decoder_input.
+                audio_emb = self.audio_input_embedding(audio_tokens)
+                audio_emb = audio_emb.transpose(0, 1).contiguous()
+                # modality_mask: [B, S] (bool/int). Broadcast to [S, B, 1].
+                mask_sbh = modality_mask.to(torch.bool).transpose(0, 1).unsqueeze(-1)
+                decoder_input = torch.where(mask_sbh, audio_emb, decoder_input)
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -447,6 +484,8 @@ class GPTModel(LanguageModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        audio_tokens: Optional[Tensor] = None,
+        modality_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -467,6 +506,8 @@ class GPTModel(LanguageModule):
             decoder_input=decoder_input,
             inference_context=inference_context,
             packed_seq_params=packed_seq_params,
+            audio_tokens=audio_tokens,
+            modality_mask=modality_mask,
         )
 
         (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset) = (

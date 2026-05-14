@@ -573,6 +573,23 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             (B, S, K), device=loss_mask.device, dtype=loss_mask.dtype
         )
 
+    # Stub audio input tokens + modality_mask for the multi-codebook INPUT
+    # embedding (paper: 4 embedding tables, summed). Generated on stages that
+    # have tokens (PP=1 or PP-first). For the stub we mark the second half of
+    # the sequence as audio so both text and audio embedding tables receive
+    # gradient. Real audio_tokens will come from the HCodec dataset later.
+    audio_tokens = None
+    modality_mask = None
+    if getattr(args, 'enable_multi_codebook_heads', False) and tokens is not None:
+        K = args.num_audio_codebooks
+        V_a = args.audio_codebook_size
+        B, S = tokens.shape
+        audio_tokens = torch.randint(
+            0, V_a, (B, S, K), device=tokens.device, dtype=tokens.dtype
+        )
+        modality_mask = torch.zeros((B, S), device=tokens.device, dtype=torch.bool)
+        modality_mask[:, S // 2:] = True  # second half is "audio"
+
     with stimer:
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels,
@@ -597,7 +614,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             else:
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask,
-                    packed_seq_params=packed_seq_params
+                    packed_seq_params=packed_seq_params,
+                    audio_tokens=audio_tokens, modality_mask=modality_mask,
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses

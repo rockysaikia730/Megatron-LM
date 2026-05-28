@@ -14,7 +14,7 @@
 #SBATCH --no-requeue
 
 # Multi-codebook smoke test on 2 nodes (8 GPUs):
-#   TP=2 x PP=2 x CP=2 x DP=1 = 8 GPUs
+#   TP=2 x PP=1 x CP=2 x DP=2 = 8 GPUs
 #   Sequence parallel ON
 #   Tiny model + mock data (NullTokenizer)
 #   20 training steps with one mid-training checkpoint save
@@ -36,7 +36,7 @@ echo "START TIME: $(date)"
 
 # Parallelism (TP * PP * CP * DP must equal total GPUs = NNODES * 4)
 TP_SIZE=2
-PP_SIZE=2
+PP_SIZE=1
 CP_SIZE=2
 
 # Tiny model dims for fast iteration. Constraints:
@@ -59,7 +59,7 @@ AUDIO_PAD_ID=127         # last index reserved for <audio_pad>
 AUDIO_LOSS_WEIGHT=1.0
 
 MBS=2
-GBS=4                    # MBS * DP * grad_accum = 2 * 1 * 2 = 4
+GBS=4                    # MBS * DP * grad_accum = 2 * 2 * 1 = 4  (DP=8/(TP*PP*CP)=2)
 TRAINING_STEPS=20
 CHECKPOINT_STEPS=10      # save once mid-run to exercise checkpoint path
 
@@ -78,6 +78,7 @@ PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
 
 EXP_DIR=$PROJECT_DIR/$EXP_NAME
 CKPT_DIR=$EXP_DIR/checkpoints
+TRIGGER_DIR=$EXP_DIR/triggers
 DEBUG_DIR=$EXP_DIR/debug/$SLURM_JOB_ID
 COMPUTE_ENVIRONMENT_DIR=$DEBUG_DIR/compute_environment.txt
 GPU_MEM_LOGGING=$DEBUG_DIR/memory_logging.txt
@@ -150,6 +151,7 @@ TRAINING_ARGS=(
 	--train-iters $TRAINING_STEPS
 	--log-interval 1
 	--eval-iters 0
+	--eval-interval 1000
 	--disable-bias-linear
 	--optimizer adam
 	--dataloader-type single
@@ -172,6 +174,7 @@ CHECKPOINTING_ARGS=(
 	--save-interval $CHECKPOINT_STEPS
 	--ckpt-format torch_dist
 	--load $CKPT_DIR
+	--trigger-path $TRIGGER_DIR
 )
 
 MIXED_PRECISION_ARGS=(
@@ -203,6 +206,7 @@ DATA_ARGS=(
 
 # Set up directories
 mkdir -p $CKPT_DIR
+mkdir -p $TRIGGER_DIR
 mkdir -p $PROJECT_DIR
 mkdir -p $DEBUG_DIR
 mkdir -p $LOGGING_DIR
@@ -249,6 +253,9 @@ echo -e "\nMegatron path: $MEGATRON_LM_DIR ($(git -C $MEGATRON_LM_DIR rev-parse 
 
 srun -lu bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $GPU_MEM_LOGGING
 
-srun --cpus-per-task $SLURM_CPUS_PER_TASK -lu bash -c "RANK=\$SLURM_PROCID LOCAL_RANK=\$SLURM_LOCALID $CMD_PREFIX $TRAINING_CMD"
+srun --cpus-per-task $SLURM_CPUS_PER_TASK -lu bash -c "
+  export LD_LIBRARY_PATH=\$(echo \$LD_LIBRARY_PATH | tr ':' '\n' | grep -v compat | paste -sd ':' -)
+  if [ -d /usr/local/cuda/compat ]; then mv /usr/local/cuda/compat /usr/local/cuda/compat_disabled 2>/dev/null || true; fi
+  RANK=\$SLURM_PROCID LOCAL_RANK=\$SLURM_LOCALID $CMD_PREFIX $TRAINING_CMD"
 
 echo "END TIME: $(date)"

@@ -37,21 +37,49 @@ class AudioTextGPTDataset(GPTDataset):
     ``audio_start_id / audio_end_id / num_audio_codebooks / audio_pad_token_id``).
     """
 
+    def _lazy_load_indexes(self) -> None:
+        """Mirror the parent's lazy-mmap-on-first-call pattern.
+
+        The parent only mmaps shuffle_index / sample_index / document_index the
+        first time _query_document_sample_shuffle_indices is called. We bypass
+        that method (we want whole-document access, not the window slice), so
+        we must trigger the same loads ourselves -- otherwise the attributes
+        remain None and indexing into them hangs / crashes.
+        """
+        import numpy as _np
+        if self.shuffle_index is None:
+            self.shuffle_index = _np.load(
+                self.path_to_shuffle_index, allow_pickle=True, mmap_mode='r'
+            )
+            self.sample_index = _np.load(
+                self.path_to_sample_index, allow_pickle=True, mmap_mode='r'
+            )
+            self.document_index = _np.load(
+                self.path_to_document_index, allow_pickle=True, mmap_mode='r'
+            )
+
     def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
         # IMPORTANT: do NOT use the parent's `_query_document_sample_shuffle_indices`.
         # That returns a fixed-length window cut from the *concatenated* token
         # stream, which would slice audio spans mid-frame and break the
         # `<audio_start> ... <audio_end>` invariant the delay collator relies on.
-        # Instead, we serve one *whole* document per sample via the document
-        # index parent already computed (epoch-shuffled, repeating as needed).
+        # Instead, we serve one *whole* document per sample, honoring the
+        # parent's epoch-shuffled document_index so the per-sample shuffle
+        # behavior matches what other GPTDataset users get.
         #
         # For FLEURS-style data each document is ~520 tokens after delay
         # expansion -- well under seq_length -- so loading whole documents
         # wastes a little compute on padding but keeps the audio span intact.
+        self._lazy_load_indexes()
+
         if idx is None:
-            doc_idx = 0
+            doc_idx = int(self.document_index[0])
         else:
-            doc_idx = int(self.document_index[idx])
+            # Use shuffle_index to pick the epoch-shuffled position, then map
+            # to the actual document id. This matches what the parent does
+            # before slicing the token window.
+            shuffled = int(self.shuffle_index[idx])
+            doc_idx = int(self.document_index[shuffled])
 
         text = self.dataset.get(doc_idx)
         text_list = text.tolist()

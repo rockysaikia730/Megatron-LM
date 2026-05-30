@@ -38,34 +38,50 @@ class AudioTextGPTDataset(GPTDataset):
     """
 
     def _lazy_load_indexes(self) -> None:
-        """Mirror the parent's lazy-mmap-on-first-call pattern.
+        """Trigger the parent's lazy index build, then ignore its outputs.
 
-        The parent only mmaps shuffle_index / sample_index / document_index the
-        first time _query_document_sample_shuffle_indices is called. We bypass
-        that method (we want whole-document access, not the window slice), so
-        we must trigger the same loads ourselves -- otherwise the attributes
-        remain None and indexing into them hangs / crashes.
+        The parent's shuffle_index/sample_index are designed for sequence
+        packing -- ``shuffle_index[idx]`` indexes into ``sample_index``, not
+        into ``document_index``, so naive composition gives wrong doc ids.
+        We don't need any of that: we want one whole document per sample.
+
+        But we DO still need to trigger the parent's index-build code path
+        once, because that's also what materialises the on-disk caches and
+        decides ``num_samples``. We call its query method on idx=0 in a
+        try/except so any window-slicing failure (e.g. mid-frame audio span)
+        is swallowed -- we just want the side effect of populating
+        ``self.document_index`` etc.
+
+        After this, we shuffle independently per-rank using a numpy RNG
+        seeded by ``config.random_seed`` so doc ordering is deterministic.
         """
+        if getattr(self, "_doc_order", None) is not None:
+            return
+
         import numpy as _np
-        if self.shuffle_index is None:
-            self.shuffle_index = _np.load(
-                self.path_to_shuffle_index, allow_pickle=True, mmap_mode='r'
-            )
-            self.sample_index = _np.load(
-                self.path_to_sample_index, allow_pickle=True, mmap_mode='r'
-            )
-            self.document_index = _np.load(
-                self.path_to_document_index, allow_pickle=True, mmap_mode='r'
-            )
+
+        # Force the parent's lazy mmap by calling the query path once. We
+        # don't care about the returned tokens; we care about the side
+        # effect of self.{shuffle,sample,document}_index being populated.
+        try:
+            self._query_document_sample_shuffle_indices(0)
+        except Exception:
+            # The window-slicing path may itself trip on a mid-audio cut;
+            # ignore -- the index mmap happens before the slice.
+            pass
+
+        # Build our own per-epoch deterministic shuffle over the *unique*
+        # documents (not the parent's sample_index slots).
+        num_docs = int(self.dataset.sequence_lengths.shape[0])
+        rng = _np.random.RandomState(int(self.config.random_seed))
+        self._doc_order = rng.permutation(num_docs).astype(_np.int64)
+        self._num_docs = num_docs
 
     def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
         # IMPORTANT: do NOT use the parent's `_query_document_sample_shuffle_indices`.
         # That returns a fixed-length window cut from the *concatenated* token
         # stream, which would slice audio spans mid-frame and break the
         # `<audio_start> ... <audio_end>` invariant the delay collator relies on.
-        # Instead, we serve one *whole* document per sample, honoring the
-        # parent's epoch-shuffled document_index so the per-sample shuffle
-        # behavior matches what other GPTDataset users get.
         #
         # For FLEURS-style data each document is ~520 tokens after delay
         # expansion -- well under seq_length -- so loading whole documents
@@ -73,13 +89,12 @@ class AudioTextGPTDataset(GPTDataset):
         self._lazy_load_indexes()
 
         if idx is None:
-            doc_idx = int(self.document_index[0])
+            doc_idx = int(self._doc_order[0])
         else:
-            # Use shuffle_index to pick the epoch-shuffled position, then map
-            # to the actual document id. This matches what the parent does
-            # before slicing the token window.
-            shuffled = int(self.shuffle_index[idx])
-            doc_idx = int(self.document_index[shuffled])
+            # Cycle through the per-epoch shuffled order. Multiple epochs use
+            # the same shuffle -- good enough for a PoC; if epoch-distinct
+            # shuffles matter later we can salt the RNG with idx // num_docs.
+            doc_idx = int(self._doc_order[idx % self._num_docs])
 
         text = self.dataset.get(doc_idx)
         text_list = text.tolist()

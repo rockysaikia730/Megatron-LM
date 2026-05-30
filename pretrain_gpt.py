@@ -130,36 +130,32 @@ def get_batch(data_iterator, vp_stage=None):
     args = get_args()
     multi_cb = getattr(args, "multi_codebook_data", False)
 
-    # `get_batch_on_this_tp_rank` pops one sample off the iterator on tp_rank=0
-    # and broadcasts. To extend that with audio tensors we need to peek at the
-    # raw sample on tp_rank=0 *before* the helper consumes it. Simpler: call
-    # the helper, then re-broadcast the 4 audio tensors using the same dict
-    # the helper just returned (the helper stores tokens etc. on it).
-    if multi_cb and parallel_state.get_tensor_model_parallel_rank() == 0:
-        # Stash the raw data so we can pull the audio tensors after the helper
-        # returns. The helper itself calls next(data_iterator); we wrap the
-        # iterator so the call inside the helper hands us the same item.
-        peeked = {"data": None}
-        original_iter = data_iterator
-
-        class _Tap:
-            def __iter__(self_inner):
-                return self_inner
-
-            def __next__(self_inner):
-                item = next(original_iter)
-                peeked["data"] = item
-                return item
-
-        data_iterator = _Tap()
-
-    batch = get_batch_on_this_tp_rank(data_iterator)
-
     if multi_cb:
-        # On tp_rank=0 we now have the raw dict in `peeked`; on other TP ranks
-        # we just allocate-and-receive in the helper below.
-        raw = peeked["data"] if parallel_state.get_tensor_model_parallel_rank() == 0 else None
-        batch = _broadcast_audio_keys_on_tp_rank(batch, raw, args)
+        # Tap pattern: on TP=0 we peek the next sample off the real iterator,
+        # stash it, and feed a one-shot iterator into get_batch_on_this_tp_rank
+        # so the helper sees and broadcasts the text-side keys exactly as it
+        # always does. We then broadcast the audio keys ourselves from the
+        # stashed dict. On non-TP-0 ranks the original iterator is untouched
+        # (the helper allocates empty tensors and receives over the TP group).
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        if tp_rank == 0:
+            assert data_iterator is not None, "data_iterator None on TP=0"
+            sample = next(data_iterator)
+            assert "audio_tokens" in sample, (
+                "multi-codebook training requires AudioTextGPTDataset; sample "
+                f"has keys {list(sample.keys())}"
+            )
+            # Feed get_batch_on_this_tp_rank a tiny iterator that yields the
+            # already-fetched sample exactly once.
+            inner_iter = iter([sample])
+            batch = get_batch_on_this_tp_rank(inner_iter)
+        else:
+            sample = None
+            batch = get_batch_on_this_tp_rank(data_iterator)
+
+        batch = _broadcast_audio_keys_on_tp_rank(batch, sample, args)
+    else:
+        batch = get_batch_on_this_tp_rank(data_iterator)
 
     packed_seq_params = None
 

@@ -1938,6 +1938,16 @@ def _add_network_size_args(parser):
                        'delay-pattern gaps. Per-codebook loss is masked at positions '
                        'whose target equals this ID. Must be a valid index, '
                        '0 <= id < --audio-codebook-size. None disables pad handling.')
+    group.add_argument('--multi-codebook-data', action='store_true',
+                       help='Use AudioTextGPTDataset (delay-pattern collator) instead '
+                       'of the plain GPTDataset. Requires --enable-multi-codebook-heads '
+                       'and a .bin/.idx preprocessed by tools/audio/preprocess_fleurs_hcodec.py.')
+    group.add_argument('--audio-start-id', type=int, default=None,
+                       help='Text-vocab id that marks the start of an audio span in '
+                       'the .bin/.idx. Must match the preprocessor.')
+    group.add_argument('--audio-end-id', type=int, default=None,
+                       help='Text-vocab id that marks the end of an audio span in '
+                       'the .bin/.idx. Must match the preprocessor.')
     group.add_argument('--moe-latent-size', type=int, default=None,
                        help='Latent projection dimension for MoE. If None, MoE latent projections are not used.')
 

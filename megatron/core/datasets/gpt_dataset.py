@@ -81,6 +81,22 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     Useful for task-control tokens (e.g. <|stt_transcribe|>, <|tts_continue|>) that
     should condition the model but never be predicted."""
 
+    audio_start_id: Optional[int] = None
+    """Text-vocab token id that marks the start of an audio span in the .bin/.idx.
+    Only consumed by AudioTextGPTDataset (multi-codebook training)."""
+
+    audio_end_id: Optional[int] = None
+    """Text-vocab token id that marks the end of an audio span in the .bin/.idx.
+    Only consumed by AudioTextGPTDataset."""
+
+    num_audio_codebooks: int = 4
+    """K, the number of RVQ codebook layers. Must match the preprocessor and
+    the model's enable_multi_codebook_heads configuration."""
+
+    audio_pad_token_id: Optional[int] = None
+    """Audio-codebook id used as <audio_pad> in delay-pattern gaps. Must match
+    the model's --audio-pad-token-id."""
+
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""

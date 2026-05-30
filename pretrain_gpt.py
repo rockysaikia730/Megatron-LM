@@ -14,6 +14,7 @@ from megatron.core import parallel_state
 from megatron.core import tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.audio_text_gpt_dataset import AudioTextGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -81,14 +82,84 @@ def tokens_to_packed_seq_params(input_ids, eod_token, orig_seq_len, qkv_format='
 
 
 
+_AUDIO_BATCH_KEYS = ("audio_tokens", "audio_labels", "audio_loss_mask", "modality_mask")
+
+
+def _broadcast_audio_keys_on_tp_rank(batch, data, args):
+    """Add multi-codebook tensors to the broadcasted batch.
+
+    `get_batch_on_this_tp_rank` only handles the 5 text-side keys. When
+    multi-codebook data is active we also need to ship the 4 audio tensors
+    over TP/PP. We broadcast unconditionally on every stage that has labels
+    or tokens (i.e. PP-first or PP-last), since those are the stages where
+    the embedding sum or the loss respectively consume the audio tensors.
+    """
+    src_rank = mpu.get_tensor_model_parallel_src_rank()
+    group = mpu.get_tensor_model_parallel_group()
+
+    tp0 = mpu.get_tensor_model_parallel_rank() == 0
+    B, S = args.micro_batch_size, args.seq_length
+    K = int(getattr(args, "num_audio_codebooks", 4))
+
+    # Shape/dtype contract; must match AudioTextGPTDataset.__getitem__.
+    specs = {
+        "audio_tokens":    ((B, S, K), torch.int64),
+        "audio_labels":    ((B, S, K), torch.int64),
+        "audio_loss_mask": ((B, S, K), torch.float32),
+        "modality_mask":   ((B, S),    torch.bool),
+    }
+
+    for key, (shape, dtype) in specs.items():
+        if tp0:
+            t = data[key].cuda(non_blocking=True)
+        else:
+            t = torch.empty(shape, dtype=dtype, device=torch.cuda.current_device())
+        torch.distributed.broadcast(t, src_rank, group=group)
+        batch[key] = t
+
+    return batch
+
+
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch with optional packed-sequence + context-parallelism support."""
 
     if not is_first_or_last_pipeline_stage(vp_stage):
-        return (None, None, None, None, None), None
+        # 5 text values + 4 audio values, all None on intermediate PP stages.
+        return (None, None, None, None, None, None, None, None, None), None
 
     args = get_args()
+    multi_cb = getattr(args, "multi_codebook_data", False)
+
+    # `get_batch_on_this_tp_rank` pops one sample off the iterator on tp_rank=0
+    # and broadcasts. To extend that with audio tensors we need to peek at the
+    # raw sample on tp_rank=0 *before* the helper consumes it. Simpler: call
+    # the helper, then re-broadcast the 4 audio tensors using the same dict
+    # the helper just returned (the helper stores tokens etc. on it).
+    if multi_cb and mpu.get_tensor_model_parallel_rank() == 0:
+        # Stash the raw data so we can pull the audio tensors after the helper
+        # returns. The helper itself calls next(data_iterator); we wrap the
+        # iterator so the call inside the helper hands us the same item.
+        peeked = {"data": None}
+        original_iter = data_iterator
+
+        class _Tap:
+            def __iter__(self_inner):
+                return self_inner
+
+            def __next__(self_inner):
+                item = next(original_iter)
+                peeked["data"] = item
+                return item
+
+        data_iterator = _Tap()
+
     batch = get_batch_on_this_tp_rank(data_iterator)
+
+    if multi_cb:
+        # On tp_rank=0 we now have the raw dict in `peeked`; on other TP ranks
+        # we just allocate-and-receive in the helper below.
+        raw = peeked["data"] if mpu.get_tensor_model_parallel_rank() == 0 else None
+        batch = _broadcast_audio_keys_on_tp_rank(batch, raw, args)
 
     packed_seq_params = None
 
@@ -249,7 +320,23 @@ def get_batch(data_iterator, vp_stage=None):
     else:
         batch = get_batch_on_this_cp_rank(batch)
 
-    return batch.values(), packed_seq_params
+    # Always return a fixed 9-tuple so downstream code can unpack without
+    # branching: 5 text values then 4 audio values (None when multi-codebook
+    # data is off so the standard path stays unchanged).
+    text_values = (
+        batch.get("tokens"),
+        batch.get("labels"),
+        batch.get("loss_mask"),
+        batch.get("attention_mask"),
+        batch.get("position_ids"),
+    )
+    audio_values = (
+        batch.get("audio_tokens"),
+        batch.get("audio_labels"),
+        batch.get("audio_loss_mask"),
+        batch.get("modality_mask"),
+    )
+    return text_values + audio_values, packed_seq_params
 
 
 
@@ -546,7 +633,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         batch_values, packed_seq_params = get_batch(data_iterator, vp_stage)
-        tokens, labels, loss_mask, attention_mask, position_ids = batch_values
+        (tokens, labels, loss_mask, attention_mask, position_ids,
+         audio_tokens, audio_labels, audio_loss_mask, modality_mask) = batch_values
 
     timers('batch-generator').stop()
 
@@ -556,26 +644,23 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     }
     loss_mask = apply_decay_modality_weights(loss_mask, labels, args, current_modality_weights)
 
-    # Stub audio labels + per-codebook loss mask when multi-codebook heads are
-    # enabled. Only generated on stages that have labels (PP=1 or PP-last) since
-    # they're only consumed by loss_func on the last pipeline stage. Real audio
-    # labels will be sourced from the HCodec-preprocessed dataset later.
-    audio_labels = None
-    audio_loss_mask = None
+    # Multi-codebook fallback: when --enable-multi-codebook-heads is on but the
+    # data loader is not multi-codebook (i.e. --mock-data smoke test), generate
+    # the same stub tensors we used to. With --multi-codebook-data the four
+    # audio tensors already came from the dataset via get_batch, so this branch
+    # is a no-op.
     audio_pad_id = getattr(args, 'audio_pad_token_id', None)
-    if getattr(args, 'enable_multi_codebook_heads', False) and labels is not None:
+    multi_cb = getattr(args, 'multi_codebook_data', False)
+    if (
+        getattr(args, 'enable_multi_codebook_heads', False)
+        and not multi_cb
+        and labels is not None
+    ):
         K = args.num_audio_codebooks
         V_a = args.audio_codebook_size
         B, S = labels.shape
-        audio_labels = torch.randint(
-            0, V_a, (B, S, K), device=labels.device, dtype=labels.dtype
-        )
-        audio_loss_mask = torch.ones(
-            (B, S, K), device=loss_mask.device, dtype=loss_mask.dtype
-        )
-        # When --audio-pad-token-id is set, simulate delay-pattern pad: at every
-        # codebook layer k, force the first k positions to be pad and zero out
-        # their loss mask. Matches the leading-edge triangle of the delay shift.
+        audio_labels = torch.randint(0, V_a, (B, S, K), device=labels.device, dtype=labels.dtype)
+        audio_loss_mask = torch.ones((B, S, K), device=loss_mask.device, dtype=loss_mask.dtype)
         if audio_pad_id is not None:
             assert 0 <= audio_pad_id < V_a, (
                 f"audio_pad_token_id={audio_pad_id} must be in [0, {V_a})"
@@ -584,28 +669,20 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 audio_labels[:, :k, k] = audio_pad_id
                 audio_loss_mask[:, :k, k] = 0
 
-    # Stub audio input tokens + modality_mask for the multi-codebook INPUT
-    # embedding (paper: 4 embedding tables, summed). Generated on stages that
-    # have tokens (PP=1 or PP-first). For the stub we mark the second half of
-    # the sequence as audio so both text and audio embedding tables receive
-    # gradient. Real audio_tokens will come from the HCodec dataset later.
-    audio_tokens = None
-    modality_mask = None
-    if getattr(args, 'enable_multi_codebook_heads', False) and tokens is not None:
+    if (
+        getattr(args, 'enable_multi_codebook_heads', False)
+        and not multi_cb
+        and tokens is not None
+    ):
         K = args.num_audio_codebooks
         V_a = args.audio_codebook_size
         B, S = tokens.shape
-        audio_tokens = torch.randint(
-            0, V_a, (B, S, K), device=tokens.device, dtype=tokens.dtype
-        )
-        # Inject the same delay-pattern pad on the INPUT side: at codebook k,
-        # the first k positions are <audio_pad>. The audio embedding tables
-        # learn a representation for the pad index just like any other token.
+        audio_tokens = torch.randint(0, V_a, (B, S, K), device=tokens.device, dtype=tokens.dtype)
         if audio_pad_id is not None:
             for k in range(1, K):
                 audio_tokens[:, :k, k] = audio_pad_id
         modality_mask = torch.zeros((B, S), device=tokens.device, dtype=torch.bool)
-        modality_mask[:, S // 2:] = True  # second half is "audio"
+        modality_mask[:, S // 2:] = True
 
     with stimer:
         if args.use_legacy_models:
@@ -717,6 +794,10 @@ def core_gpt_dataset_config_from_args(args):
         "vision_weight": args.vision_weight,
         "audio_weight": args.audio_weight,
         "loss_mask_token_ids": getattr(args, "loss_mask_token_ids", None),
+        "audio_start_id": getattr(args, "audio_start_id", None),
+        "audio_end_id": getattr(args, "audio_end_id", None),
+        "num_audio_codebooks": getattr(args, "num_audio_codebooks", 4),
+        "audio_pad_token_id": getattr(args, "audio_pad_token_id", None),
     }
 
     # add FIM args to the config
@@ -760,6 +841,20 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
             dataset_type = MockGPTDataset
         elif args.fim_data:
             dataset_type = GPTFIMDataset
+        elif getattr(args, "multi_codebook_data", False):
+            # AudioTextGPTDataset returns the 8 delay-pattern tensors expected by
+            # the multi-codebook model; activated only when --multi-codebook-data
+            # is set so the standard text-only path is unaffected by default.
+            assert getattr(args, "enable_multi_codebook_heads", False), (
+                "--multi-codebook-data requires --enable-multi-codebook-heads"
+            )
+            assert args.audio_start_id is not None and args.audio_end_id is not None, (
+                "--multi-codebook-data requires --audio-start-id and --audio-end-id"
+            )
+            assert args.audio_pad_token_id is not None, (
+                "--multi-codebook-data requires --audio-pad-token-id"
+            )
+            dataset_type = AudioTextGPTDataset
         else:
             dataset_type = GPTDataset
 

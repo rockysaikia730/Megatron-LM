@@ -94,10 +94,10 @@ def _broadcast_audio_keys_on_tp_rank(batch, data, args):
     or tokens (i.e. PP-first or PP-last), since those are the stages where
     the embedding sum or the loss respectively consume the audio tensors.
     """
-    src_rank = mpu.get_tensor_model_parallel_src_rank()
-    group = mpu.get_tensor_model_parallel_group()
+    src_rank = parallel_state.get_tensor_model_parallel_src_rank()
+    group = parallel_state.get_tensor_model_parallel_group()
 
-    tp0 = mpu.get_tensor_model_parallel_rank() == 0
+    tp0 = parallel_state.get_tensor_model_parallel_rank() == 0
     B, S = args.micro_batch_size, args.seq_length
     K = int(getattr(args, "num_audio_codebooks", 4))
 
@@ -135,7 +135,7 @@ def get_batch(data_iterator, vp_stage=None):
     # raw sample on tp_rank=0 *before* the helper consumes it. Simpler: call
     # the helper, then re-broadcast the 4 audio tensors using the same dict
     # the helper just returned (the helper stores tokens etc. on it).
-    if multi_cb and mpu.get_tensor_model_parallel_rank() == 0:
+    if multi_cb and parallel_state.get_tensor_model_parallel_rank() == 0:
         # Stash the raw data so we can pull the audio tensors after the helper
         # returns. The helper itself calls next(data_iterator); we wrap the
         # iterator so the call inside the helper hands us the same item.
@@ -158,7 +158,7 @@ def get_batch(data_iterator, vp_stage=None):
     if multi_cb:
         # On tp_rank=0 we now have the raw dict in `peeked`; on other TP ranks
         # we just allocate-and-receive in the helper below.
-        raw = peeked["data"] if mpu.get_tensor_model_parallel_rank() == 0 else None
+        raw = peeked["data"] if parallel_state.get_tensor_model_parallel_rank() == 0 else None
         batch = _broadcast_audio_keys_on_tp_rank(batch, raw, args)
 
     packed_seq_params = None

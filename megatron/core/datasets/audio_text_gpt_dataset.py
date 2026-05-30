@@ -38,16 +38,22 @@ class AudioTextGPTDataset(GPTDataset):
     """
 
     def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
-        # Pull the raw .bin/.idx slice exactly as the parent would (handles None
-        # for batch-padding sequences, document-sample-shuffle indexing, etc.).
+        # IMPORTANT: do NOT use the parent's `_query_document_sample_shuffle_indices`.
+        # That returns a fixed-length window cut from the *concatenated* token
+        # stream, which would slice audio spans mid-frame and break the
+        # `<audio_start> ... <audio_end>` invariant the delay collator relies on.
+        # Instead, we serve one *whole* document per sample via the document
+        # index parent already computed (epoch-shuffled, repeating as needed).
+        #
+        # For FLEURS-style data each document is ~520 tokens after delay
+        # expansion -- well under seq_length -- so loading whole documents
+        # wastes a little compute on padding but keeps the audio span intact.
         if idx is None:
-            text, _ = self._query_document_sample_shuffle_indices(0)
+            doc_idx = 0
         else:
-            text, _ = self._query_document_sample_shuffle_indices(idx)
+            doc_idx = int(self.document_index[idx])
 
-        # ``text`` already has length ``seq_length + add_extra_token_to_sequence``;
-        # the collator handles the trailing token by treating it as the target
-        # of the last position, so we trim to seq_length for the input view.
+        text = self.dataset.get(doc_idx)
         text_list = text.tolist()
         seq_length = self.config.sequence_length
 

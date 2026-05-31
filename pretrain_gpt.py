@@ -738,11 +738,29 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     audio_loss_mask=audio_loss_mask,
                 )
             else:
+                # Diagnostic: pinpoint a forward-pass hang to model() entry,
+                # so we can tell it apart from a get_batch hang or a loss hang.
+                _mcb_dbg = getattr(args, '_mcb_broadcast_debug', True)
+                if _mcb_dbg and torch.distributed.get_rank() == 0:
+                    at = None if audio_tokens is None else tuple(audio_tokens.shape)
+                    mm = None if modality_mask is None else tuple(modality_mask.shape)
+                    tk = None if tokens is None else tuple(tokens.shape)
+                    print(
+                        f"[rank0] forward START tokens={tk} audio_tokens={at} "
+                        f"modality_mask={mm}",
+                        flush=True,
+                    )
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask,
                     packed_seq_params=packed_seq_params,
                     audio_tokens=audio_tokens, modality_mask=modality_mask,
                 )
+                if _mcb_dbg and torch.distributed.get_rank() == 0:
+                    if isinstance(output_tensor, dict):
+                        shapes = {k: tuple(v.shape) for k, v in output_tensor.items() if hasattr(v, 'shape')}
+                        print(f"[rank0] forward DONE  out=dict {shapes}", flush=True)
+                    else:
+                        print(f"[rank0] forward DONE  out.shape={tuple(output_tensor.shape)}", flush=True)
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(

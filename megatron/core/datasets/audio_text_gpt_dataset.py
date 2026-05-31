@@ -61,13 +61,6 @@ class AudioTextGPTDataset(GPTDataset):
         self._doc_order = rng.permutation(num_docs).astype(_np.int64)
         self._num_docs = num_docs
 
-        if int(torch.distributed.get_rank()) == 0:
-            print(
-                f"[AudioTextGPTDataset] {num_docs} unique documents, "
-                f"first 5 shuffled doc ids = {self._doc_order[:5].tolist()}",
-                flush=True,
-            )
-
     def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
         # IMPORTANT: do NOT use the parent's `_query_document_sample_shuffle_indices`.
         # That returns a fixed-length window cut from the *concatenated* token

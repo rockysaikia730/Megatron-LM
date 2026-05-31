@@ -93,6 +93,15 @@ def _broadcast_audio_keys_on_tp_rank(batch, data, args):
     over TP/PP. We broadcast unconditionally on every stage that has labels
     or tokens (i.e. PP-first or PP-last), since those are the stages where
     the embedding sum or the loss respectively consume the audio tensors.
+
+    Reliability notes:
+      * `.to(device, non_blocking=False)` rather than .cuda(non_blocking=True).
+        Async H2D copies can race with NCCL broadcast (broadcast may enqueue
+        before the copy completes), causing rank 0 to send garbage and the
+        receivers to hang on watchdog timeout.
+      * Print on rank 0 around each broadcast so a hang is locatable
+        (gated by enable_multi_codebook_heads to keep the text-only path
+        quiet).
     """
     src_rank = parallel_state.get_tensor_model_parallel_src_rank()
     group = parallel_state.get_tensor_model_parallel_group()
@@ -100,6 +109,7 @@ def _broadcast_audio_keys_on_tp_rank(batch, data, args):
     tp0 = parallel_state.get_tensor_model_parallel_rank() == 0
     B, S = args.micro_batch_size, args.seq_length
     K = int(getattr(args, "num_audio_codebooks", 4))
+    device = torch.cuda.current_device()
 
     # Shape/dtype contract; must match AudioTextGPTDataset.__getitem__.
     specs = {
@@ -109,12 +119,38 @@ def _broadcast_audio_keys_on_tp_rank(batch, data, args):
         "modality_mask":   ((B, S),    torch.bool),
     }
 
+    debug = getattr(args, "_mcb_broadcast_debug", True)
+
     for key, (shape, dtype) in specs.items():
         if tp0:
-            t = data[key].cuda(non_blocking=True)
+            if key not in data:
+                raise KeyError(
+                    f"AudioTextGPTDataset sample missing '{key}'; got keys "
+                    f"{list(data.keys())}"
+                )
+            src = data[key]
+            if tuple(src.shape) != shape:
+                raise ValueError(
+                    f"audio key '{key}' shape mismatch: got {tuple(src.shape)}, "
+                    f"helper expected {shape} (B={B}, S={S}, K={K})"
+                )
+            if src.dtype != dtype:
+                raise ValueError(
+                    f"audio key '{key}' dtype mismatch: got {src.dtype}, "
+                    f"helper expected {dtype}"
+                )
+            # Blocking copy to GPU so the broadcast sees fully-written memory.
+            t = src.to(device=device, dtype=dtype, non_blocking=False)
+            if debug:
+                print(f"[rank0] mcb broadcast START {key} shape={shape} dtype={dtype}",
+                      flush=True)
         else:
-            t = torch.empty(shape, dtype=dtype, device=torch.cuda.current_device())
+            t = torch.empty(shape, dtype=dtype, device=device)
+
         torch.distributed.broadcast(t, src_rank, group=group)
+
+        if tp0 and debug:
+            print(f"[rank0] mcb broadcast DONE  {key}", flush=True)
         batch[key] = t
 
     return batch

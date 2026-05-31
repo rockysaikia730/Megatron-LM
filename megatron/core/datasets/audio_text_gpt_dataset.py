@@ -38,44 +38,35 @@ class AudioTextGPTDataset(GPTDataset):
     """
 
     def _lazy_load_indexes(self) -> None:
-        """Trigger the parent's lazy index build, then ignore its outputs.
+        """Build our per-rank doc permutation. Idempotent.
 
-        The parent's shuffle_index/sample_index are designed for sequence
-        packing -- ``shuffle_index[idx]`` indexes into ``sample_index``, not
-        into ``document_index``, so naive composition gives wrong doc ids.
-        We don't need any of that: we want one whole document per sample.
-
-        But we DO still need to trigger the parent's index-build code path
-        once, because that's also what materialises the on-disk caches and
-        decides ``num_samples``. We call its query method on idx=0 in a
-        try/except so any window-slicing failure (e.g. mid-frame audio span)
-        is swallowed -- we just want the side effect of populating
-        ``self.document_index`` etc.
-
-        After this, we shuffle independently per-rank using a numpy RNG
-        seeded by ``config.random_seed`` so doc ordering is deterministic.
+        We deliberately do NOT touch the parent's shuffle/sample/document
+        indexes -- they are built for sequence-packing and indexing into them
+        with our "one whole doc per sample" model produces wrong / OOB doc ids
+        (manifesting as hangs on bad mmap reads). All we need is the parent's
+        already-initialised ``self.dataset`` (an IndexedDataset), which gives
+        us per-doc lengths and ``get(doc_id)``.
         """
         if getattr(self, "_doc_order", None) is not None:
             return
 
         import numpy as _np
 
-        # Force the parent's lazy mmap by calling the query path once. We
-        # don't care about the returned tokens; we care about the side
-        # effect of self.{shuffle,sample,document}_index being populated.
-        try:
-            self._query_document_sample_shuffle_indices(0)
-        except Exception:
-            # The window-slicing path may itself trip on a mid-audio cut;
-            # ignore -- the index mmap happens before the slice.
-            pass
-
-        # Build our own per-epoch deterministic shuffle over the *unique*
-        # documents (not the parent's sample_index slots).
         num_docs = int(self.dataset.sequence_lengths.shape[0])
+        if num_docs == 0:
+            raise RuntimeError(
+                "AudioTextGPTDataset: underlying IndexedDataset has 0 documents"
+            )
         rng = _np.random.RandomState(int(self.config.random_seed))
         self._doc_order = rng.permutation(num_docs).astype(_np.int64)
         self._num_docs = num_docs
+
+        if int(torch.distributed.get_rank()) == 0:
+            print(
+                f"[AudioTextGPTDataset] {num_docs} unique documents, "
+                f"first 5 shuffled doc ids = {self._doc_order[:5].tolist()}",
+                flush=True,
+            )
 
     def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
         # IMPORTANT: do NOT use the parent's `_query_document_sample_shuffle_indices`.

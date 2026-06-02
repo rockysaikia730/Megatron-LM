@@ -18,7 +18,6 @@
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=460000
-#SBATCH --environment=/users/%u/.edf/megatronedf.toml
 #SBATCH --no-requeue
 
 ################ MODE selection ################
@@ -165,7 +164,6 @@ export TRANSFORMERS_OFFLINE=1
 
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=29501
-export WORLD_SIZE=$SLURM_NPROCS
 
 ulimit -c 0
 
@@ -361,6 +359,7 @@ srun -lu --mpi=pmix --network=disable_rdzv_get \
         fi
         export RANK=\$SLURM_PROCID
         export LOCAL_RANK=\$SLURM_LOCALID
+        export WORLD_SIZE=\$SLURM_NPROCS
         $CMD_PREFIX $TRAINING_CMD
     "
 

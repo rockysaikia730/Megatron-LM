@@ -1920,10 +1920,9 @@ def _add_network_size_args(parser):
                        'which serves as an additional training objective.')
     group.add_argument('--enable-multi-codebook-heads', action='store_true',
                        help='Enable parallel multi-codebook output heads for RVQ-based '
-                       'audio token prediction (e.g., HCodec-1.0). When enabled, K audio '
+                       'audio token prediction. When enabled, K audio '
                        'heads are added alongside the text output head; the model becomes '
-                       'a multi-modal decoder. Backward compatible: when off, model '
-                       'behavior is unchanged.')
+                       'a multi-modal decoder.')
     group.add_argument('--num-audio-codebooks', type=int, default=4,
                        help='Number of RVQ audio codebooks (K) when '
                        '--enable-multi-codebook-heads is set. Default 4 (HCodec-1.0).')
@@ -1939,15 +1938,14 @@ def _add_network_size_args(parser):
                        'whose target equals this ID. Must be a valid index, '
                        '0 <= id < --audio-codebook-size. None disables pad handling.')
     group.add_argument('--multi-codebook-data', action='store_true',
-                       help='Use AudioTextGPTDataset (delay-pattern collator) instead '
-                       'of the plain GPTDataset. Requires --enable-multi-codebook-heads '
-                       'and a .bin/.idx preprocessed by tools/audio/preprocess_fleurs_hcodec.py.')
+                       help='Use AudioTextGPTDataset instead of the plain GPTDataset.'
+                       'Requires --enable-multi-codebook-heads and a .bin/.idx.')
     group.add_argument('--audio-start-id', type=int, default=None,
                        help='Text-vocab id that marks the start of an audio span in '
-                       'the .bin/.idx. Must match the preprocessor.')
+                       'the .bin/.idx.')
     group.add_argument('--audio-end-id', type=int, default=None,
                        help='Text-vocab id that marks the end of an audio span in '
-                       'the .bin/.idx. Must match the preprocessor.')
+                       'the .bin/.idx.')
     group.add_argument('--moe-latent-size', type=int, default=None,
                        help='Latent projection dimension for MoE. If None, MoE latent projections are not used.')
 

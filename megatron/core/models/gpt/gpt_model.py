@@ -316,9 +316,9 @@ class GPTModel(LanguageModule):
         Applies embeddings to input tokens, or uses `decoder_input` from a previous
         pipeline stage. Also sets up rotary positional embeddings.
 
-        When multi-codebook input embedding is enabled and `audio_tokens` are
-        provided, audio positions (selected by `modality_mask`) replace the
-        text embedding with a sum-of-K-codebook-embedding lookup.
+        When multi-codebook input embedding is enabled and audio_tokens are
+        provided, audio positions (selected by torch.where(`modality_mask`,...)) 
+        replace the text embedding with a audio embedding lookup.
         """
 
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
@@ -333,17 +333,16 @@ class GPTModel(LanguageModule):
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
 
             # Multi-codebook input merge: at audio positions, replace the text
-            # embedding with the sum of K codebook embeddings. Both tensors
-            # live in [S, B, H] (Megatron's seq-first internal layout).
+            # embedding with the audio embedding. Both tensors are [S, B, H].
             if (
                 getattr(self, 'audio_input_embedding', None) is not None
                 and audio_tokens is not None
                 and modality_mask is not None
             ):
-                # audio_emb: [B, S, H] -> transpose to [S, B, H] to match decoder_input.
+                # audio_emb: [B, S, H] -> transpose to [S, B, H].
                 audio_emb = self.audio_input_embedding(audio_tokens)
                 audio_emb = audio_emb.transpose(0, 1).contiguous()
-                # modality_mask: [B, S] (bool/int). Broadcast to [S, B, 1].
+                # modality_mask: [B, S]. Broadcast to [S, B, 1].
                 mask_sbh = modality_mask.to(torch.bool).transpose(0, 1).unsqueeze(-1).contiguous()
                 # Under sequence parallel, the text embedding has already been
                 # split along the sequence dim into [S/TP, B, H]. Apply the same
@@ -710,9 +709,9 @@ class GPTModel(LanguageModule):
 
         if self.audio_output_heads is not None:
             # Multi-codebook mode: compute K parallel audio heads alongside the
-            # text head. Return a dict of logits (both keys in [B, S, ...]
-            # layout). In-model loss is bypassed so the training script's
-            # loss_func can handle K+1 cross-entropies with per-head masks.
+            # text head. Return a dict of logits. In-model loss is bypassed so 
+            # the training script's loss_func can handle K+1 cross-entropies with 
+            # per-head masks.
             audio_logits = self.audio_output_heads(hidden_states)
             return {
                 "text": logits.transpose(0, 1).contiguous(),

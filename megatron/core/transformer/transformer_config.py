@@ -53,33 +53,22 @@ class TransformerConfig(ModelParallelConfig):
 
     enable_multi_codebook_heads: bool = False
     """If True, add K parallel audio output heads alongside the text output head for
-    RVQ-based audio token prediction (e.g., HCodec-1.0). The K audio heads share the
-    same hidden state as the text head and are computed in parallel; modality routing
-    is handled by the data pipeline via per-position loss masks. Backward compatible:
-    when False, model behavior is identical to the standard GPT setup."""
+    RVQ-based audio token prediction."""
 
     num_audio_codebooks: int = 4
-    """Number of RVQ audio codebooks (K). Each codebook gets its own ColumnParallelLinear
-    output head. Only used when `enable_multi_codebook_heads` is True.
-    Default 4 matches HCodec-1.0."""
+    """Number of RVQ audio codebooks (K)."""
 
     audio_codebook_size: int = 1024
-    """Per-codebook audio vocabulary size (V_a). Each audio head projects
-    hidden_size -> audio_codebook_size. Only used when `enable_multi_codebook_heads`
-    is True. Default 1024 matches HCodec-1.0."""
+    """Per-codebook audio vocabulary size (V_a)."""
 
     audio_loss_weight: float = 1.0
-    """Weight (lambda) applied to the audio loss in the total loss formulation
-    L = L_text + lambda * mean_k(L_audio_k). Only used by the multi-codebook loss
-    function in the training script."""
+    """Weight (lambda) applied to the audio loss in the total loss
+    L = L_text + lambda * mean_k(L_audio_k)."""
 
     audio_pad_token_id: Optional[int] = None
     """Reserved index in the audio codebook vocabulary used as the `<audio_pad>`
-    filler in delay-pattern gaps. When set, the data pipeline emits this index
-    at the empty slots created by the delay shift, and the per-codebook audio
-    loss mask is zeroed at positions where the target equals this index. Must
-    satisfy 0 <= audio_pad_token_id < audio_codebook_size. None disables pad
-    handling (no delay gaps in the data, or pad masking is done elsewhere)."""
+    filler in delay-pattern gaps. Must satisfy 0 <= audio_pad_token_id < audio_codebook_size. 
+    None disables pad handling (no delay gaps in the data, or pad masking is done elsewhere)."""
 
     num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of transformer layers on first pipeline stage.

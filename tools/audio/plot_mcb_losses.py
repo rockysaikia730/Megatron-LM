@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """Parse Megatron iteration log lines and plot the 6 multi-codebook losses.
 
-The training loop prints one line per iteration like::
-
-  iteration  100/  100 | ... | lm loss: 1.32E+01 | text loss: 8.42E+00 |
-    audio loss mean: 5.00E+00 | audio loss k0: 4.79E+00 | audio loss k1: ... |
-    audio loss k2: ... | audio loss k3: ... | loss scale: 1.0 | grad norm: 5.7 | ...
-
-This script greps those lines, pulls out the 7 numbers, and emits a single PNG.
-
 Usage::
 
   python tools/audio/plot_mcb_losses.py \\
@@ -82,8 +74,7 @@ def main() -> None:
     ax_loss.plot(iters, series["lm"],         label="lm loss (combined)",       linewidth=2)
     ax_loss.plot(iters, series["text"],       label="text loss",                linewidth=2)
     ax_loss.plot(iters, series["audio_mean"], label="audio loss (mean over K)", linewidth=2)
-    ax_loss.axhline(6.93, ls="--", color="grey", alpha=0.6,
-                    label="audio random baseline = ln(1024)")
+
     ax_loss.set_ylabel("loss")
     ax_loss.set_title(args.title)
     ax_loss.legend(loc="upper right")
@@ -92,7 +83,6 @@ def main() -> None:
     # Panel 2: per-codebook losses
     for k in ("k0", "k1", "k2", "k3"):
         ax_aud.plot(iters, series[k], label=f"audio loss {k}", linewidth=1.5)
-    ax_aud.axhline(6.93, ls="--", color="grey", alpha=0.6)
     ax_aud.set_xlabel("iteration")
     ax_aud.set_ylabel("per-codebook loss")
     ax_aud.legend(loc="upper right", ncol=2)

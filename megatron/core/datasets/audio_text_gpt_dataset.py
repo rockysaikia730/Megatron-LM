@@ -10,15 +10,6 @@ packing) and only overrides ``__getitem__`` to:
   2. Re-parse it with ``build_delay_pattern_sample`` to extract the audio span
      between the configured markers, apply the MusicGen delay shift, and emit
      the seven per-position tensors the multi-codebook GPT model expects.
-
-The parent's text-only path (``tokens / labels / loss_mask / position_ids``)
-is replaced by the collator output, which also returns ``modality_mask /
-audio_tokens / audio_labels / audio_loss_mask``. All eight tensors share the
-same sequence length, so downstream batch broadcasting, CP slicing, and
-packing logic apply uniformly.
-
-Activation: pass ``--multi-codebook-data`` plus marker ids matching whatever
-the preprocessor wrote (``tools/audio/preprocess_fleurs_hcodec.py``).
 """
 
 from typing import Dict, Optional
@@ -32,20 +23,11 @@ from megatron.core.datasets.gpt_dataset import GPTDataset
 class AudioTextGPTDataset(GPTDataset):
     """GPTDataset variant that produces multi-codebook delay-pattern tensors.
 
-    Construction follows the standard ``MegatronDataset`` pattern; the only
-    extra state lives on ``self.config`` (see ``GPTDatasetConfig`` fields
-    ``audio_start_id / audio_end_id / num_audio_codebooks / audio_pad_token_id``).
+    Construction follows the standard ``MegatronDataset`` pattern.
     """
 
     def _lazy_load_indexes(self) -> None:
-        """Build our per-rank doc permutation. Idempotent.
-
-        We deliberately do NOT touch the parent's shuffle/sample/document
-        indexes -- they are built for sequence-packing and indexing into them
-        with our "one whole doc per sample" model produces wrong / OOB doc ids
-        (manifesting as hangs on bad mmap reads). All we need is the parent's
-        already-initialised ``self.dataset`` (an IndexedDataset), which gives
-        us per-doc lengths and ``get(doc_id)``.
+        """Build our per-rank doc permutation.
         """
         if getattr(self, "_doc_order", None) is not None:
             return
@@ -66,10 +48,6 @@ class AudioTextGPTDataset(GPTDataset):
         # That returns a fixed-length window cut from the *concatenated* token
         # stream, which would slice audio spans mid-frame and break the
         # `<audio_start> ... <audio_end>` invariant the delay collator relies on.
-        #
-        # For FLEURS-style data each document is ~520 tokens after delay
-        # expansion -- well under seq_length -- so loading whole documents
-        # wastes a little compute on padding but keeps the audio span intact.
         self._lazy_load_indexes()
 
         if idx is None:

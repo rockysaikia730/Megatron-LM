@@ -3,22 +3,10 @@
 """Multi-codebook output heads for RVQ-based audio prediction.
 
 Provides K parallel output heads, one per RVQ codebook, for training a
-decoder-LM (e.g., Llama3) to predict HCodec-1.0 audio tokens alongside text.
+decoder-LM to predict HCodec-1.0 audio tokens alongside text.
 The K heads share the hidden state with the text output head and are computed
 in parallel; modality routing (text vs audio, acoustic vs semantic) is handled
 by the data pipeline via per-position loss masks.
-
-Parallelism support:
-  - TP: each head is a ColumnParallelLinear, sharding the audio vocab across
-    the TP group. `gather_output=False` so the loss can use
-    `vocab_parallel_cross_entropy` without materializing the full vocab.
-  - PP: instantiated only on the last pipeline stage (caller gates on
-    `post_process=True`). VPP-safe because gating is at construction time.
-  - CP: no internal CP handling needed; the hidden state arriving at the head
-    is already sequence-sharded by upstream blocks, and CP-aware loss
-    reduction happens in the loss function on each head independently.
-  - DP: parameters are standard nn.Parameter, so they are discovered and
-    sharded by the distributed optimizer automatically.
 """
 
 from typing import Optional

@@ -2,24 +2,9 @@
 
 """Multi-codebook input embedding for RVQ audio tokens.
 
-Mirror of `MultiCodebookOutputHead` on the input side: K independent embedding
-tables, one per RVQ codebook layer. At each audio position, the K codebook
-tokens are looked up in their respective tables and the K resulting vectors
-are summed into a single H-dim transformer input. Same architecture as
-described in UniTok-Audio Section 3.2.2:
-
-    "4 embedding layers handle 4-layer tokens respectively, and the embeddings
-     of each layer are added up as the input of transformer layers"
-
-Parallelism support:
-  - TP: each table is a VocabParallelEmbedding, sharding the audio vocab
-    across the TP group (same machinery as the text word_embeddings).
-  - PP: instantiated only on the first pipeline stage (caller gates on
-    `pre_process=True`). VPP-safe because gating is at construction time.
-  - CP: no internal CP handling needed; CP shards the sequence at the
-    data-loader level, and embeddings are pointwise per position.
-  - DP: parameters are standard nn.Parameter, so they are discovered and
-    sharded by the distributed optimizer automatically.
+K independent embedding tables, one per RVQ codebook layer. At each audio position, the K codebook
+tokens are looked up in their respective tables and the K resulting vectors are summed into a single 
+H-dim transformer input. Same architecture as described in UniTok-Audio Section 3.2.2 (https://arxiv.org/pdf/2510.26372)
 """
 
 from typing import Optional
@@ -69,8 +54,7 @@ class MultiCodebookInputEmbedding(MegatronModule):
         self.codebook_vocab_size = codebook_vocab_size
 
         tp_group = pg_collection.tp if pg_collection is not None else None
-        # Use embedding_init_method to match the text word_embeddings convention
-        # (LanguageModelEmbedding also uses config.embedding_init_method).
+
         init_method = getattr(
             config, 'embedding_init_method', config.init_method
         )
@@ -90,7 +74,7 @@ class MultiCodebookInputEmbedding(MegatronModule):
         )
 
     def forward(self, audio_token_ids: Tensor) -> Tensor:
-        """Look up and sum embeddings for K codebooks at every position.
+        """Sum embeddings for K codebooks at every position.
 
         Args:
             audio_token_ids: Long tensor of shape [B, S, K]. Position (b, s, k)

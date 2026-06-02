@@ -91,13 +91,7 @@ def _broadcast_audio_keys_on_tp_rank(batch, data, args):
     `get_batch_on_this_tp_rank` only handles the 5 text-side keys. When
     multi-codebook data is active we also need to ship the 4 audio tensors
     over TP/PP. We broadcast unconditionally on every stage that has labels
-    or tokens (i.e. PP-first or PP-last), since those are the stages where
-    the embedding sum or the loss respectively consume the audio tensors.
-
-    Uses a blocking H2D copy on tp_rank=0 so the NCCL broadcast sees fully-
-    written memory; an async copy + immediate broadcast can race -> rank 0
-    sends a partially-filled buffer and the receivers hang on watchdog
-    timeout instead of crashing cleanly.
+    or tokens (i.e. PP-first or PP-last).
     """
     src_rank = parallel_state.get_tensor_model_parallel_src_rank()
     group = parallel_state.get_tensor_model_parallel_group()
@@ -107,7 +101,6 @@ def _broadcast_audio_keys_on_tp_rank(batch, data, args):
     K = int(getattr(args, "num_audio_codebooks", 4))
     device = torch.cuda.current_device()
 
-    # Shape/dtype contract; must match AudioTextGPTDataset.__getitem__.
     specs = {
         "audio_tokens":    ((B, S, K), torch.int64),
         "audio_labels":    ((B, S, K), torch.int64),
@@ -154,12 +147,11 @@ def get_batch(data_iterator, vp_stage=None):
     multi_cb = getattr(args, "multi_codebook_data", False)
 
     if multi_cb:
-        # Tap pattern: on TP=0 we peek the next sample off the real iterator,
-        # stash it, and feed a one-shot iterator into get_batch_on_this_tp_rank
-        # so the helper sees and broadcasts the text-side keys exactly as it
-        # always does. We then broadcast the audio keys ourselves from the
-        # stashed dict. On non-TP-0 ranks the original iterator is untouched
-        # (the helper allocates empty tensors and receives over the TP group).
+        # On TP=0 we peek the next sample off the real iterator, stash it, 
+        # and feed a one-shot iterator into get_batch_on_this_tp_rank
+        # and broadcasts the text-side keys exactly as it always does. 
+        # We then broadcast the audio keys from the stashed dict. 
+        # On non-TP-0 ranks the original iterator is untouched
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         if tp_rank == 0:
             assert data_iterator is not None, "data_iterator None on TP=0"
@@ -419,9 +411,8 @@ def apply_decay_modality_weights(loss_mask: torch.Tensor, labels: torch.Tensor, 
 def _vocab_parallel_ce_bs(logits_bs: torch.Tensor, labels_bs: torch.Tensor) -> torch.Tensor:
     """Run vocab_parallel_cross_entropy on [B, S, ...] tensors.
 
-    The Megatron CE expects seq-first logits [S, B, V/TP] and targets [S, B].
-    This helper does the transpose round-trip so callers can stay in [B, S, ...]
-    layout. Returns per-token loss [B, S].
+    The Megatron CE expects [S, B, V/TP] and targets [S, B].
+    Returns per-token loss [B, S].
     """
     logits_sb = logits_bs.transpose(0, 1).contiguous()
     labels_sb = labels_bs.transpose(0, 1).contiguous()
@@ -664,10 +655,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     loss_mask = apply_decay_modality_weights(loss_mask, labels, args, current_modality_weights)
 
     # Multi-codebook fallback: when --enable-multi-codebook-heads is on but the
-    # data loader is not multi-codebook (i.e. --mock-data smoke test), generate
-    # the same stub tensors we used to. With --multi-codebook-data the four
-    # audio tensors already came from the dataset via get_batch, so this branch
-    # is a no-op.
+    # data loader is not multi-codebook (for dummy data), generate
+    # the same stub tensors we used to.
     audio_pad_id = getattr(args, 'audio_pad_token_id', None)
     multi_cb = getattr(args, 'multi_codebook_data', False)
     if (

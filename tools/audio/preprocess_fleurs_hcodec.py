@@ -7,32 +7,15 @@ Each output document is a single flat int32 sequence laid out as
 
     [ <text_tokens...>  <audio_start_id>  <audio_codes_flat...>  <audio_end_id> ]
 
-where ``<audio_codes_flat>`` is the row-major flattening of the per-sample
-``[T_50, K]`` codebook matrix produced by HCodec-1.5 in fixed-rate mode
-(acoustic and semantic 25Hz streams interleaved frame-by-frame to 50Hz). At
-training time the multi-codebook GPT consumes this document via
-``megatron/core/datasets/delay_pattern.py`` which performs the delay shift,
-attaches modality masks, and produces the per-position tensors the model sees.
-
-Marker IDs live in the padded-vocab "slack" range that the swissai tokenizer
-already pads to (``make-vocab-size-divisible-by 128``). Two reserved IDs are
-appropriated here so we don't need to surgery the tokenizer for the PoC; for
-the production run we'll move to a proper tokenizer extension (see
-``tools/checkpoint/extend_megatron_vocab.py``).
-
-This script lives in the *audio-tokenizer* container (HCodec deps), not the
-Megatron training container; the only Megatron dependency is the
-``IndexedDatasetBuilder`` writer, which is pure-Python + numpy.
-
 Example
 -------
     python preprocess_fleurs_hcodec.py \\
         --hcodec-repo /users/$USER/benchmark-audio-tokenizer/src \\
+        --megatron-repo /iopsstor/scratch/cscs/$USER/Megatron-LM \\
         --fleurs-dir /capstor/store/cscs/swissai/infra01/audio-datasets/benchmark/fleurs_cache/en_us \\
         --output-prefix /iopsstor/scratch/cscs/$USER/datasets/fleurs_en_us_hcodec/train \\
         --tokenizer alehc/swissai-tokenizer \\
-        --audio-start-id 131080 --audio-end-id 131081 \\
-        --max-samples 500
+        --audio-start-id 131080 --audio-end-id 131081
 """
 
 import argparse
@@ -56,11 +39,6 @@ logger = logging.getLogger("preprocess_fleurs")
 def hcodec_to_interleaved(merged_codes: torch.Tensor) -> torch.Tensor:
     """Turn HCodecWrapper.encode output into a flat-row ``[T_50, K]`` matrix.
 
-    HCodecWrapper returns ``[B, 2, K, T_25]`` where dim 1 stacks (acoustic,
-    semantic) and dim 3 is 25Hz. The downstream model treats audio as a single
-    interleaved 50Hz stream with K codebook columns. Interleaving order:
-    acoustic frame t, semantic frame t, acoustic frame t+1, semantic t+1, ...
-
     Args:
         merged_codes: ``[B, 2, K, T_25]`` integer codebook ids from HCodec.
 
@@ -78,8 +56,7 @@ def hcodec_to_interleaved(merged_codes: torch.Tensor) -> torch.Tensor:
         )
     acoustic = merged_codes[0, 0]                       # [K, T_25]
     semantic = merged_codes[0, 1]                       # [K, T_25]
-    # Stack the two streams on a new last axis, then flatten that axis with the
-    # time axis: positions become (t=0,a), (t=0,s), (t=1,a), (t=1,s), ...
+
     stacked = torch.stack([acoustic, semantic], dim=-1)  # [K, T_25, 2]
     K, T_25, _ = stacked.shape
     interleaved = stacked.reshape(K, T_25 * 2)           # [K, T_50]
@@ -97,15 +74,11 @@ def build_document(
     audio_end_id: int,
     audio_codebook_size: int,
 ) -> np.ndarray:
-    """Assemble one flat int32 document.
+    """Assemble flat int32 document.
 
     Layout (one document)::
 
         [ text_ids... , audio_start_id , audio_flat... , audio_end_id ]
-
-    ``audio_flat`` is the row-major flattening of ``audio_TK`` (frame 0's K
-    codebook ids, then frame 1's, ...). The training-side delay collator parses
-    this back into ``[T_50, K]`` using the marker IDs.
 
     Args:
         text_ids: text-vocab token ids for the transcript.
@@ -199,8 +172,7 @@ def main() -> None:
         format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
     )
 
-    # Imports gated on CLI paths so the script reports a clear error if either
-    # repo is missing, instead of an unhelpful traceback at the top.
+
     sys.path.insert(0, args.hcodec_repo)
     sys.path.insert(0, args.megatron_repo)
     from audio_tokenizers.implementations.hcodec import HCodecWrapper

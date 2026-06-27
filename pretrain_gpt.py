@@ -136,6 +136,94 @@ def _broadcast_audio_keys_on_tp_rank(batch, data, args):
     return batch
 
 
+_FLATTEN_BATCH_KEYS = ("tokens", "labels", "loss_mask", "position_ids", "modality_mask")
+
+
+def _broadcast_flatten_keys_on_tp_rank(data, args):
+    """Broadcast the flatten-mode batch tensors across the TP group.
+
+    Flatten mode (--audio-pattern flatten) feeds the stock single-head model a
+    union-vocab batch, so unlike the delay path there are no separate audio
+    tensors -- but ``position_ids`` is ``[B, 3, S]`` (time, depth, stream), which
+    the standard ``get_batch_on_this_tp_rank`` does not handle. We broadcast every
+    key ourselves and return the dict.
+    """
+    src_rank = parallel_state.get_tensor_model_parallel_src_rank()
+    group = parallel_state.get_tensor_model_parallel_group()
+    tp0 = parallel_state.get_tensor_model_parallel_rank() == 0
+    B, S = args.micro_batch_size, args.seq_length
+    device = torch.cuda.current_device()
+
+    specs = {
+        "tokens":        ((B, S),    torch.int64),
+        "labels":        ((B, S),    torch.int64),
+        "loss_mask":     ((B, S),    torch.float32),
+        "position_ids":  ((B, 3, S), torch.int64),
+        "modality_mask": ((B, S),    torch.bool),
+    }
+
+    batch = {}
+    for key, (shape, dtype) in specs.items():
+        if tp0:
+            if key not in data:
+                raise KeyError(
+                    f"flatten AudioTextGPTDataset sample missing '{key}'; got "
+                    f"keys {list(data.keys())}"
+                )
+            src = data[key]
+            if tuple(src.shape) != shape:
+                raise ValueError(
+                    f"flatten key '{key}' shape mismatch: got {tuple(src.shape)}, "
+                    f"expected {shape} (B={B}, S={S})"
+                )
+            t = src.to(device=device, dtype=dtype, non_blocking=False)
+        else:
+            t = torch.empty(shape, dtype=dtype, device=device)
+        torch.distributed.broadcast(t, src_rank, group=group)
+        batch[key] = t
+    return batch
+
+
+def _get_batch_flatten(data_iterator, args):
+    """get_batch for --audio-pattern flatten (stock GPT batch + 3D positions).
+
+    ``position_ids`` is kept at FULL ``[3, B, S]`` length -- the
+    MultimodalRotaryEmbedding CP-slices the rotary embedding internally
+    (rotary_pos_embedding.py), so slicing the positions here as well would
+    double-slice. tokens/labels/loss_mask/modality_mask are CP-sliced along the
+    sequence dimension as usual. Returns the standard 9-tuple with the audio_*
+    slots None (audio lives in the union vocab, not in separate tensors).
+    """
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    if tp_rank == 0:
+        assert data_iterator is not None, "data_iterator None on TP=0"
+        sample = next(data_iterator)
+    else:
+        sample = None
+    batch = _broadcast_flatten_keys_on_tp_rank(sample, args)
+
+    # [B, 3, S] -> [3, B, S] for MultimodalRotaryEmbedding.
+    batch["position_ids"] = batch["position_ids"].permute(1, 0, 2).contiguous()
+
+    cp_size = parallel_state.get_context_parallel_world_size()
+    if cp_size > 1:
+        # Pop position_ids so get_batch_on_this_cp_rank (which slices seq_dim=1)
+        # doesn't mangle the [3, B, S] layout; the mrope module slices it itself.
+        pos = batch.pop("position_ids")
+        batch = get_batch_on_this_cp_rank(batch)
+        batch["position_ids"] = pos
+
+    text_values = (
+        batch.get("tokens"),
+        batch.get("labels"),
+        batch.get("loss_mask"),
+        None,  # attention_mask: use --no-create-attention-mask-in-dataloader
+        batch.get("position_ids"),
+    )
+    audio_values = (None, None, None, batch.get("modality_mask"))
+    return text_values + audio_values, None
+
+
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch with optional packed-sequence + context-parallelism support."""
 
@@ -146,8 +234,14 @@ def get_batch(data_iterator, vp_stage=None):
     args = get_args()
     multi_cb = getattr(args, "multi_codebook_data", False)
 
+    if multi_cb and getattr(args, "audio_pattern", "delay") == "flatten":
+        # Flatten + 3D-RoPE: stock single-head batch over the union vocab, with
+        # full-length [3, B, S] positions. Self-contained (own TP/CP handling),
+        # so it returns early and skips the delay/packed-seq logic below.
+        return _get_batch_flatten(data_iterator, args)
+
     if multi_cb:
-        # On TP=0 we peek the next sample off the real iterator, stash it, 
+        # On TP=0 we peek the next sample off the real iterator, stash it,
         # and feed a one-shot iterator into get_batch_on_this_tp_rank
         # and broadcasts the text-side keys exactly as it always does. 
         # We then broadcast the audio keys from the stashed dict. 
@@ -806,6 +900,11 @@ def core_gpt_dataset_config_from_args(args):
         "audio_end_id": getattr(args, "audio_end_id", None),
         "num_audio_codebooks": getattr(args, "num_audio_codebooks", 4),
         "audio_pad_token_id": getattr(args, "audio_pad_token_id", None),
+        "audio_pattern": getattr(args, "audio_pattern", "delay"),
+        "audio_vocab_base": getattr(args, "audio_vocab_base", None),
+        "audio_codebook_size": getattr(args, "audio_codebook_size", 1024),
+        "audio_num_streams": getattr(args, "audio_num_streams", 2),
+        "audio_stream_order": getattr(args, "audio_stream_order", "semantic_first"),
     }
 
     # add FIM args to the config
@@ -850,18 +949,36 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         elif args.fim_data:
             dataset_type = GPTFIMDataset
         elif getattr(args, "multi_codebook_data", False):
-            # AudioTextGPTDataset returns the 8 delay-pattern tensors expected by
-            # the multi-codebook model; activated only when --multi-codebook-data
-            # is set so the standard text-only path is unaffected by default.
-            assert getattr(args, "enable_multi_codebook_heads", False), (
-                "--multi-codebook-data requires --enable-multi-codebook-heads"
-            )
+            # AudioTextGPTDataset serves whole audio documents; the per-position
+            # layout depends on --audio-pattern. Activated only when
+            # --multi-codebook-data is set so the text-only path is unaffected.
             assert args.audio_start_id is not None and args.audio_end_id is not None, (
                 "--multi-codebook-data requires --audio-start-id and --audio-end-id"
             )
-            assert args.audio_pad_token_id is not None, (
-                "--multi-codebook-data requires --audio-pad-token-id"
-            )
+            if getattr(args, "audio_pattern", "delay") == "flatten":
+                # Flatten + 3D RoPE: unified vocab + single head, so neither the
+                # parallel audio heads nor the delay <audio_pad> are used.
+                assert args.audio_vocab_base is not None, (
+                    "--audio-pattern flatten requires --audio-vocab-base"
+                )
+                assert args.position_embedding_type == "mrope", (
+                    "--audio-pattern flatten requires --position-embedding-type "
+                    "mrope (3D time x depth x stream RoPE)"
+                )
+                assert args.mrope_section is not None, (
+                    "--audio-pattern flatten requires --mrope-section"
+                )
+                assert args.audio_vocab_base > max(args.audio_start_id, args.audio_end_id), (
+                    f"--audio-vocab-base ({args.audio_vocab_base}) must be above "
+                    f"the audio markers ({args.audio_start_id}, {args.audio_end_id})"
+                )
+            else:
+                assert getattr(args, "enable_multi_codebook_heads", False), (
+                    "--audio-pattern delay requires --enable-multi-codebook-heads"
+                )
+                assert args.audio_pad_token_id is not None, (
+                    "--audio-pattern delay requires --audio-pad-token-id"
+                )
             dataset_type = AudioTextGPTDataset
         else:
             dataset_type = GPTDataset

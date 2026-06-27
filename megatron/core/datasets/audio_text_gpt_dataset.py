@@ -17,6 +17,7 @@ from typing import Dict, Optional
 import torch
 
 from megatron.core.datasets.delay_pattern import build_delay_pattern_sample
+from megatron.core.datasets.flatten_pattern import build_flatten_pattern_sample
 from megatron.core.datasets.gpt_dataset import GPTDataset
 
 
@@ -62,6 +63,10 @@ class AudioTextGPTDataset(GPTDataset):
         text_list = text.tolist()
         seq_length = self.config.sequence_length
 
+        audio_pattern = getattr(self.config, "audio_pattern", "delay")
+        if audio_pattern == "flatten":
+            return self._getitem_flatten(text_list, seq_length, idx)
+
         sample = build_delay_pattern_sample(
             flat_tokens=text_list,
             seq_length=seq_length,
@@ -92,4 +97,38 @@ class AudioTextGPTDataset(GPTDataset):
             out["loss_mask"].zero_()
             out["audio_loss_mask"].zero_()
 
+        return out
+
+    def _getitem_flatten(
+        self, text_list: list, seq_length: int, idx: Optional[int]
+    ) -> Dict[str, torch.Tensor]:
+        """Flatten + 3D-RoPE sample (unified vocab, single head).
+
+        Returns the *stock* GPT keys plus ``modality_mask``; there are no
+        separate ``audio_*`` tensors because audio tokens live in the same
+        union vocabulary as text. ``position_ids`` is ``[3, S]``
+        (time, depth, stream).
+        """
+        sample = build_flatten_pattern_sample(
+            flat_tokens=text_list,
+            seq_length=seq_length,
+            num_codebooks=int(self.config.num_audio_codebooks),
+            audio_start_id=int(self.config.audio_start_id),
+            audio_end_id=int(self.config.audio_end_id),
+            audio_vocab_base=int(self.config.audio_vocab_base),
+            audio_codebook_size=int(self.config.audio_codebook_size),
+            num_streams=int(self.config.audio_num_streams),
+            stream_order=str(self.config.audio_stream_order),
+        )
+
+        out: Dict[str, torch.Tensor] = {
+            "tokens": torch.tensor(sample["tokens"], dtype=torch.long),
+            "labels": torch.tensor(sample["labels"], dtype=torch.long),
+            "loss_mask": torch.tensor(sample["loss_mask"], dtype=torch.float32),
+            # [3, S]: (time, depth, stream); collated to [B, 3, S].
+            "position_ids": torch.tensor(sample["position_ids"], dtype=torch.long),
+            "modality_mask": torch.tensor(sample["modality_mask"], dtype=torch.bool),
+        }
+        if idx is None:
+            out["loss_mask"].zero_()
         return out

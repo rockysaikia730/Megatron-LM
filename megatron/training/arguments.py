@@ -1946,6 +1946,28 @@ def _add_network_size_args(parser):
     group.add_argument('--audio-end-id', type=int, default=None,
                        help='Text-vocab id that marks the end of an audio span in '
                        'the .bin/.idx.')
+    group.add_argument('--audio-pattern', type=str, default='delay',
+                       choices=['delay', 'flatten'],
+                       help="Audio collation mode for --multi-codebook-data. "
+                       "'delay' (default): MusicGen delay + K parallel audio heads "
+                       "under 1D RoPE (requires --enable-multi-codebook-heads). "
+                       "'flatten': one sequence position per (time, codebook, "
+                       "stream) with 3D time x depth x stream RoPE and a single "
+                       "unified-vocab head (requires --position-embedding-type "
+                       "mrope and --audio-vocab-base; does NOT use "
+                       "--enable-multi-codebook-heads).")
+    group.add_argument('--audio-vocab-base', type=int, default=None,
+                       help="Union-vocab offset where audio token ids begin in "
+                       "--audio-pattern flatten. Must sit above the highest "
+                       "text/marker id. audio_id = audio_vocab_base "
+                       "+ stream*(K*V_a) + k*V_a + codebook_value.")
+    group.add_argument('--audio-num-streams', type=int, default=2,
+                       help='Number of interleaved audio streams in flatten mode '
+                       '(acoustic + semantic = 2). Default 2.')
+    group.add_argument('--audio-stream-order', type=str, default='semantic_first',
+                       choices=['semantic_first', 'acoustic_first'],
+                       help='Per-timestep stream emission order in flatten mode. '
+                       'Default semantic_first (acoustic conditions on semantic).')
     group.add_argument('--moe-latent-size', type=int, default=None,
                        help='Latent projection dimension for MoE. If None, MoE latent projections are not used.')
 

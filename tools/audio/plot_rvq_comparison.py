@@ -6,7 +6,7 @@ Parses both the per-iteration *training* lines and the single *validation*
 k0..k3``) and the flatten format (``audio_token_loss`` / ``ac_k*`` / ``sem_k*``),
 and produces two PNGs:
 
-  rvq_training_curves.png   audio-NLL training curves (both runs) + random baseline
+  rvq_training_curves.png   audio-NLL training curves (both runs)
   rvq_heldout_comparison.png  held-out audio NLL: overall + per-codebook bars
 
 Usage::

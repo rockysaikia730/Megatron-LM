@@ -125,10 +125,7 @@ def iter_fleurs(
     format. FLEURS exposes a ``raw_transcription`` field plus ``audio.array`` /
     ``audio.sampling_rate``.
 
-    ``skip_samples`` skips the first N documents (a start offset); combined with
-    ``max_samples`` it carves a contiguous range, so train/dev can be made
-    DISJOINT even when the cache is a single split (e.g. train = first 580 via
-    ``--max-samples 580``; dev = the rest via ``--skip-samples 580``).
+    ``skip_samples`` skips the first N documents (a start offset)
     """
     from datasets import load_from_disk
 

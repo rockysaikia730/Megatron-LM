@@ -117,21 +117,32 @@ def iter_fleurs(
     fleurs_dir: str,
     split: str = "train",
     max_samples: Optional[int] = None,
+    skip_samples: int = 0,
 ) -> Iterable[Tuple[np.ndarray, int, str]]:
     """Yield ``(audio_array_mono_float32, sample_rate, transcript)`` triples.
 
     Uses HuggingFace ``datasets.load_from_disk`` if the directory is in HF cache
     format. FLEURS exposes a ``raw_transcription`` field plus ``audio.array`` /
     ``audio.sampling_rate``.
+
+    ``skip_samples`` skips the first N documents (a start offset); combined with
+    ``max_samples`` it carves a contiguous range, so train/dev can be made
+    DISJOINT even when the cache is a single split (e.g. train = first 580 via
+    ``--max-samples 580``; dev = the rest via ``--skip-samples 580``).
     """
     from datasets import load_from_disk
 
     ds = load_from_disk(fleurs_dir)
     if split in ds:
         ds = ds[split]
-    n = len(ds) if max_samples is None else min(max_samples, len(ds))
-    logger.info(f"FLEURS: yielding {n} samples from {fleurs_dir} ({split=})")
-    for i in range(n):
+    total = len(ds)
+    start = min(max(skip_samples, 0), total)
+    end = total if max_samples is None else min(start + max_samples, total)
+    logger.info(
+        f"FLEURS: yielding samples [{start}, {end}) of {total} from "
+        f"{fleurs_dir} ({split=})"
+    )
+    for i in range(start, end):
         sample = ds[i]
         audio = sample["audio"]
         transcript = sample.get("raw_transcription") or sample.get("transcription") or ""
@@ -163,7 +174,12 @@ def main() -> None:
                     help="V_a, the per-codebook vocab (HCodec=1024).")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--max-samples", type=int, default=None,
-                    help="Cap on samples processed; omit for full split.")
+                    help="Cap on samples processed (counted from --skip-samples); "
+                    "omit for the rest of the split.")
+    ap.add_argument("--skip-samples", type=int, default=0,
+                    help="Skip the first N documents (start offset). Use with "
+                    "--max-samples to carve DISJOINT train/dev from one split: "
+                    "train '--max-samples 580', dev '--skip-samples 580'.")
     ap.add_argument("--log-every", type=int, default=50)
     args = ap.parse_args()
 
@@ -207,7 +223,9 @@ def main() -> None:
     n_tokens = 0
     t0 = time.time()
 
-    for audio_np, sr, transcript in iter_fleurs(args.fleurs_dir, args.split, args.max_samples):
+    for audio_np, sr, transcript in iter_fleurs(
+        args.fleurs_dir, args.split, args.max_samples, args.skip_samples
+    ):
         # Skip empty / malformed entries quietly so one bad row doesn't kill the run.
         if audio_np.size == 0 or not transcript:
             continue

@@ -1,12 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for the flatten-pattern collator (3D time x depth x stream positions).
-
-Pure-Python: no numpy / torch / pytest fixtures required, so it can be run
-directly with ``python3 tests/unit_tests/data/test_flatten_pattern.py`` as well
-as under pytest. The torch-only ``collate_flatten_pattern_batch`` is exercised
-separately and skipped when torch is unavailable.
-"""
+"""Unit tests for the flatten-pattern collator (3D time x depth x stream positions)."""
 
 try:
     from megatron.core.datasets.flatten_pattern import (
@@ -14,8 +8,6 @@ try:
         revert_flatten_audio,
     )
 except ModuleNotFoundError:
-    # Standalone path: megatron.core.__init__ imports torch, which may be absent
-    # in a bare dev env. Load the pure-Python module directly from its file.
     import importlib.util
     import os
 

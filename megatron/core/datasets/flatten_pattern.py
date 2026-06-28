@@ -1,44 +1,33 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Flatten-pattern collator for RVQ audio tokens with 3D (time x depth x stream) positions.
+"""Flatten-pattern for RVQ audio tokens with 3D (time x depth x stream) positions.
 
-Unlike the delay-pattern collator (which sums K codebooks per frame and trains K
-parallel audio heads under 1D RoPE), the flatten collator gives every codebook
-its own sequence position so the model can carry a genuine **3D rotary position**:
+The flatten collator gives every codebook its own sequence position so the model can 
+carry a **3D rotary position**:
 
     axis 0 = physical 25Hz time  tau   (advances by 1 per timestep)
     axis 1 = codebook depth      k     (0 .. K-1)
     axis 2 = stream              s     (0 = acoustic, 1 = semantic)
 
-Audio tokens are mapped into a single *union* vocabulary that extends the text
-vocab, so the model uses one embedding table and one output head (stock GPT)
-rather than separate audio tables/heads. Text tokens (including the two markers)
-keep their text-vocab ids and get the degenerate position ``(p, p, p)`` which,
-fed to Megatron's MultimodalRotaryEmbedding, reduces to ordinary 1D RoPE.
+Audio tokens are mapped into a single vocabulary that extends the text
+vocab, so the model uses one embedding table and one output head rather than 
+separate audio tables/heads.
 
-Storage format in the .bin/.idx (unchanged, shared with the delay collator)
+Storage format in the .bin/.idx
 --------------------------------------------------------------------------
     [ text...  <audio_start>  f0_0..f0_{K-1}  f1_0.. ..  f_{T50-1}_{K-1}  <audio_end>  text... ]
 
 The ``T50`` stored frames are the already-interleaved 50Hz HCodec stream: even
-rows are acoustic, odd rows semantic, paired by physical time -- stored row
+rows are acoustic, odd rows semantic, paired by physical time stored row
 ``2*tau`` is acoustic at time ``tau`` and row ``2*tau + 1`` is semantic at time
-``tau`` (see tools/audio/preprocess_fleurs_hcodec.py::hcodec_to_interleaved).
+``tau``.
 
-Union vocabulary id for an audio token
+Vocabulary id for an audio token
 ---------------------------------------
     audio_id = audio_vocab_base + stream*(K*V_a) + k*V_a + codebook_value
 with ``codebook_value`` in ``[0, V_a)``. ``audio_vocab_base`` must sit above the
 highest text/marker id; the resulting audio block spans
 ``num_streams * K * V_a`` ids (2*4*1024 = 8192 by default).
-
-What the collator produces (one model sequence of length ``seq_length``)
-------------------------------------------------------------------------
-    tokens        [S]      union-vocab input id (text_pad_id in padding)
-    labels        [S]      next-position union id (0 in padding / last position)
-    loss_mask     [S]      1.0 where a real next-token target exists, else 0.0
-    position_ids  [3][S]   (tau, k, s) per audio position; (p, p, p) per text
-    modality_mask [S]      True where the INPUT position is an audio token
 """
 
 from typing import Dict, List, Tuple
@@ -69,14 +58,7 @@ def _parse_emitted(
     num_streams: int,
     stream_order: str,
 ) -> List[Tuple[int, Tuple[int, int, int], bool]]:
-    """Expand a flat document into the linear list of model positions.
-
-    Each emitted entry is ``(union_id, (a0, a1, a2), is_audio)``. A running
-    ``base`` counter tracks *physical time*: every text token consumes one time
-    unit, and an audio span of ``T_phys`` physical timesteps consumes ``T_phys``
-    time units (NOT ``T_phys * num_streams * K``), so the time axis stays aligned
-    to physical frames while the depth/stream axes carry the per-frame expansion.
-    """
+    """Expand a flat document into the linear list of model positions."""
     K = num_codebooks
     V_a = audio_codebook_size
     order = _stream_order(stream_order)

@@ -1985,7 +1985,7 @@ def _add_network_size_args(parser):
     group.add_argument('--audio-pattern', type=str, default='delay',
                        choices=['delay', 'flatten'],
                        help="Audio collation mode for --multi-codebook-data. "
-                       "'delay' (default): MusicGen delay + K parallel audio heads "
+                       "'delay' (default): delay + K parallel audio heads "
                        "under 1D RoPE (requires --enable-multi-codebook-heads). "
                        "'flatten': one sequence position per (time, codebook, "
                        "stream) with 3D time x depth x stream RoPE and a single "

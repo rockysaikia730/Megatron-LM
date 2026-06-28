@@ -15,6 +15,7 @@ onelogger.err
 .venv
 runs/
 /test_cases/
+plots/
 **/dist/
 core_nid*
 .idea/

@@ -94,25 +94,22 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Audio-codebook id used as <audio_pad> in delay-pattern gaps."""
 
     audio_pattern: str = "delay"
-    """Audio collation mode: 'delay' (MusicGen delay + K parallel heads, 1D RoPE)
-    or 'flatten' (one sequence position per (time, codebook, stream) with 3D
+    """Audio collation mode: 'delay' or 'flatten' with 3D
     time x depth x stream RoPE and a single unified-vocab head)."""
 
     audio_vocab_base: Optional[int] = None
-    """Union-vocab offset where audio token ids begin in 'flatten' mode; must sit
+    """Audio vocab offset where audio token ids begin in 'flatten' mode; must sit
     above the highest text/marker id. audio_id = audio_vocab_base
     + stream*(K*V_a) + k*V_a + codebook_value."""
 
     audio_codebook_size: int = 1024
-    """V_a, the per-codebook audio vocabulary size (HCodec = 1024)."""
+    """V_a, the per-codebook audio vocabulary size."""
 
     audio_num_streams: int = 2
-    """Number of interleaved audio streams (acoustic + semantic = 2)."""
+    """Number of interleaved audio streams (acoustic/semantic or both)."""
 
     audio_stream_order: str = "semantic_first"
-    """Per-timestep stream emission order in 'flatten' mode:
-    'semantic_first' or 'acoustic_first'."""
-
+    """'semantic_first' or 'acoustic_first'."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""

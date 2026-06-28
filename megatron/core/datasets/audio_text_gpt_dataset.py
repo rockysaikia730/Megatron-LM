@@ -2,13 +2,11 @@
 
 """GPT-style dataset that returns the multi-codebook delay-pattern tensors.
 
-This thin wrapper reuses the parent ``GPTDataset`` machinery for everything
-expensive (mmaped .bin/.idx access, document-sample-shuffle indices, sequence
-packing) and only overrides ``__getitem__`` to:
+Overrides ``__getitem__`` to:
 
-  1. Pull the raw document text (parent's ``_query_document_sample_shuffle_indices``).
+  1. Pull the raw document text.
   2. Re-parse it with ``build_delay_pattern_sample`` to extract the audio span
-     between the configured markers, apply the MusicGen delay shift, and emit
+     between the configured markers, apply the delay shift, and emit
      the seven per-position tensors the multi-codebook GPT model expects.
 """
 
@@ -22,14 +20,10 @@ from megatron.core.datasets.gpt_dataset import GPTDataset
 
 
 class AudioTextGPTDataset(GPTDataset):
-    """GPTDataset variant that produces multi-codebook delay-pattern tensors.
-
-    Construction follows the standard ``MegatronDataset`` pattern.
-    """
+    """GPTDataset variant that produces multi-codebook delay-pattern tensors."""
 
     def _lazy_load_indexes(self) -> None:
-        """Build our per-rank doc permutation.
-        """
+        """Build our per-rank doc permutation."""
         if getattr(self, "_doc_order", None) is not None:
             return
 
@@ -45,18 +39,11 @@ class AudioTextGPTDataset(GPTDataset):
         self._num_docs = num_docs
 
     def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
-        # IMPORTANT: do NOT use the parent's `_query_document_sample_shuffle_indices`.
-        # That returns a fixed-length window cut from the *concatenated* token
-        # stream, which would slice audio spans mid-frame and break the
-        # `<audio_start> ... <audio_end>` invariant the delay collator relies on.
         self._lazy_load_indexes()
 
         if idx is None:
             doc_idx = int(self._doc_order[0])
         else:
-            # Cycle through the per-epoch shuffled order. Multiple epochs use
-            # the same shuffle -- good enough for a PoC; if epoch-distinct
-            # shuffles matter later we can salt the RNG with idx // num_docs.
             doc_idx = int(self._doc_order[idx % self._num_docs])
 
         text = self.dataset.get(doc_idx)
@@ -102,13 +89,7 @@ class AudioTextGPTDataset(GPTDataset):
     def _getitem_flatten(
         self, text_list: list, seq_length: int, idx: Optional[int]
     ) -> Dict[str, torch.Tensor]:
-        """Flatten + 3D-RoPE sample (unified vocab, single head).
-
-        Returns the *stock* GPT keys plus ``modality_mask``; there are no
-        separate ``audio_*`` tensors because audio tokens live in the same
-        union vocabulary as text. ``position_ids`` is ``[3, S]``
-        (time, depth, stream).
-        """
+        """Flatten + 3D-RoPE sample (unified vocab & single head)."""
         sample = build_flatten_pattern_sample(
             flat_tokens=text_list,
             seq_length=seq_length,

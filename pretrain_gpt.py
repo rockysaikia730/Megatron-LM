@@ -140,14 +140,7 @@ _FLATTEN_BATCH_KEYS = ("tokens", "labels", "loss_mask", "position_ids", "modalit
 
 
 def _broadcast_flatten_keys_on_tp_rank(data, args):
-    """Broadcast the flatten-mode batch tensors across the TP group.
-
-    Flatten mode (--audio-pattern flatten) feeds the stock single-head model a
-    union-vocab batch, so unlike the delay path there are no separate audio
-    tensors -- but ``position_ids`` is ``[B, 3, S]`` (time, depth, stream), which
-    the standard ``get_batch_on_this_tp_rank`` does not handle. We broadcast every
-    key ourselves and return the dict.
-    """
+    """Broadcast the flatten-mode batch tensors across the TP group."""
     src_rank = parallel_state.get_tensor_model_parallel_src_rank()
     group = parallel_state.get_tensor_model_parallel_group()
     tp0 = parallel_state.get_tensor_model_parallel_rank() == 0
@@ -185,15 +178,7 @@ def _broadcast_flatten_keys_on_tp_rank(data, args):
 
 
 def _get_batch_flatten(data_iterator, args):
-    """get_batch for --audio-pattern flatten (stock GPT batch + 3D positions).
-
-    ``position_ids`` is kept at FULL ``[3, B, S]`` length -- the
-    MultimodalRotaryEmbedding CP-slices the rotary embedding internally
-    (rotary_pos_embedding.py), so slicing the positions here as well would
-    double-slice. tokens/labels/loss_mask/modality_mask are CP-sliced along the
-    sequence dimension as usual. Returns the standard 9-tuple with the audio_*
-    slots None (audio lives in the union vocab, not in separate tensors).
-    """
+    """get_batch for --audio-pattern flatten (GPT batch + 3D positions)."""
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     if tp_rank == 0:
         assert data_iterator is not None, "data_iterator None on TP=0"

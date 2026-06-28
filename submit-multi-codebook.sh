@@ -1,15 +1,6 @@
 #!/bin/bash
-#
-# Two modes (toggle with MODE below):
-#
-#   MODE=test   Tiny toy model + mock data on 2 nodes (8 GPUs).
-#                Validates TP × PP × CP × SP wiring + multi-codebook plumbing
-#                without depending on any preprocessed dataset. ~5 minutes.
-#
-#   MODE=fleurs  Full Llama3-8B + real FLEURS-en_us HCodec audio on 1 node
-#                (4 GPUs). The configuration that produced our PoC numbers.
-#                
-#
+# MODE=test Default 
+# MODE=fleurs  Full Llama3-8B + real FLEURS-en_us HCodec audio on 1 node
 
 #SBATCH --account=infra01
 #SBATCH --time=01:00:00

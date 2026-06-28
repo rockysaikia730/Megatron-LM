@@ -1,26 +1,5 @@
 #!/bin/bash
-#
-# Launch flatten + 3D-RoPE (time x depth x stream) RVQ-audio training on Clariden.
-#
-# This is the --audio-pattern flatten counterpart of submit-multi-codebook.sh:
-# every (time, codebook, stream) cell is its own sequence position, audio tokens
-# share a single UNION vocabulary with text (one embedding, one head, stock CE),
-# and positions carry a genuine 3D rotary embedding via --position-embedding-type
-# mrope. No parallel audio heads, no summed embeddings, no delay <audio_pad>.
-#
-# Two modes (toggle with MODE below):
-#
-#   MODE=smoke   Tiny model + real FLEURS .bin on 1 node (4 GPUs), TP=2 x CP=2.
-#                Exercises the full flatten path INCLUDING the CP position-id
-#                handling (the double-slice trap) on real audio. ~few minutes.
-#
-#   MODE=fleurs  Full Llama3-8B + real FLEURS-en_us HCodec audio on 1 node
-#                (4 GPUs), TP=4. Produces the held-out NLL for the comparison
-#                against the delay baseline.
-#
-# Both modes use the SAME audio/vocab config because they read the SAME .bin
-# (HCodec V_a=1024); only the transformer size / parallelism / iters differ.
-#
+
 #SBATCH --account=infra01
 #SBATCH --time=01:00:00
 #SBATCH --partition=debug
@@ -33,8 +12,7 @@
 #SBATCH --no-requeue
 
 ################ MODE selection ################
-# Override at submit time:  MODE=fleurs sbatch submit-flatten-3drope.sh
-MODE="${MODE:-smoke}"
+MODE="${MODE:-fleurs}"
 
 if [[ "$MODE" != "smoke" && "$MODE" != "fleurs" ]]; then
     echo "ERROR: MODE must be 'smoke' or 'fleurs'; got '$MODE'" >&2

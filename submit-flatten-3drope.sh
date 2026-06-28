@@ -23,6 +23,8 @@
 #
 #SBATCH --account=infra01
 #SBATCH --time=01:00:00
+#SBATCH --partition=debug
+#SBATCH --environment=megatronedf
 #SBATCH --job-name=rvq-flat
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err

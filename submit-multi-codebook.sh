@@ -297,6 +297,39 @@ elif [[ "$MODE" == "fleurs" ]]; then
 fi
 
 
+################ Train vs held-out eval toggle ################
+# EVAL=true (MODE=fleurs) -> load the trained delay checkpoint and run held-out
+# eval ONLY (--skip-train) over the dev .bin, reporting 'audio loss mean' + the
+# per-codebook k0..k3 NLL. Preprocess the dev set first (same format as train),
+# then:  EVAL=true MODE=fleurs sbatch submit-multi-codebook.sh
+# Set EVAL_ITERS so EVAL_ITERS*GBS covers the dev docs.
+EVAL="${EVAL:-false}"
+VALID_DATA_PATH_PREFIX="${VALID_PREFIX:-/iopsstor/scratch/cscs/$USER/datasets/fleurs_en_us_hcodec/dev}"
+EVAL_ITERS="${EVAL_ITERS:-100}"
+EVAL_CONTROL_ARGS=()
+if [[ "$EVAL" == "true" ]]; then
+    if [[ "$MODE" != "fleurs" ]]; then
+        echo "ERROR: EVAL=true requires MODE=fleurs (needs the real dev .bin)" >&2
+        exit 1
+    fi
+    echo "EVAL mode: held-out eval of $CKPT_DIR on $VALID_DATA_PATH_PREFIX ($EVAL_ITERS iters)"
+    # AudioTextGPTDataset ignores --split, so the dev set must be a SEPARATE
+    # --valid-data-path (not a split of train) to be genuinely held out.
+    DATA_ARGS=(
+        --train-data-path 1.0 "$DATA_PATH_PREFIX"
+        --valid-data-path 1.0 "$VALID_DATA_PATH_PREFIX"
+        --multi-codebook-data
+        --audio-start-id $AUDIO_START_ID
+        --audio-end-id $AUDIO_END_ID
+        --seq-length $SEQ_LEN
+        --num-workers 1
+        --num-dataset-builder-threads 1
+    )
+    EVAL_CONTROL_ARGS=( --skip-train --eval-iters $EVAL_ITERS )
+    CHECKPOINTING_ARGS=( --load "$CKPT_DIR" --ckpt-format torch_dist )   # load only, no --save
+fi
+
+
 ################ Compose the command ################
 cd "$MEGATRON_LM_DIR"
 export PYTHONPATH="$MEGATRON_LM_DIR:$PYTHONPATH"
@@ -310,6 +343,7 @@ TRAINING_CMD="python3 $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${LOGGING_ARGS[@]} \
     ${REGULARIZATION_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
+    ${EVAL_CONTROL_ARGS[@]} \
     ${INITIALIZATION_ARGS[@]} \
     ${LEARNING_RATE_ARGS[@]} \
     ${CHECKPOINTING_ARGS[@]} \

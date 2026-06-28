@@ -1381,6 +1381,42 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
 
+    # Flatten-pattern audio (--audio-pattern flatten) trains a single head over a
+    # union vocab, so audio + text losses are mixed in one CE. Derive
+    # base_vocab_size + omnimodal_config from the audio layout so loss_func's
+    # existing per-modality label-range bucketing reports text vs audio (and each
+    # stream/codebook) NLL separately -- in both training logs and --eval-iters.
+    # Reporting-only: megatron/core never reads base_vocab_size, so the output
+    # head (sized by padded_vocab_size) is unaffected.
+    if (
+        getattr(args, "audio_pattern", "delay") == "flatten"
+        and getattr(args, "audio_vocab_base", None) is not None
+        and getattr(args, "base_vocab_size", None) is None
+    ):
+        _base = int(args.audio_vocab_base)
+        _K = int(args.num_audio_codebooks)
+        _Va = int(args.audio_codebook_size)
+        _S = int(getattr(args, "audio_num_streams", 2))
+        args.base_vocab_size = _base
+        _stream_names = ["ac", "sem", "s2", "s3"]  # 0=acoustic, 1=semantic, ...
+        _modalities = [
+            {"name": "audio", "offset": _base, "vocab_size": _S * _K * _Va},
+        ]
+        for _s in range(_S):
+            _sname = _stream_names[_s] if _s < len(_stream_names) else f"s{_s}"
+            for _k in range(_K):
+                _modalities.append({
+                    "name": f"{_sname}_k{_k}",
+                    "offset": _base + _s * (_K * _Va) + _k * _Va,
+                    "vocab_size": _Va,
+                })
+        args.omnimodal_config = {"modalities": _modalities}
+        warn_rank_0(
+            f"[flatten] audio NLL reporting on: base_vocab_size={_base}, "
+            f"{len(_modalities)} buckets (audio + {_S * _K} per stream/codebook).",
+            args.rank,
+        )
+
     # Print arguments.
     _print_args("arguments", args)
 

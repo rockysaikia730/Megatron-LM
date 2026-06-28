@@ -233,8 +233,6 @@ TRAINING_ARGS=(
     --global-batch-size $GBS
     --train-iters $TRAINING_STEPS
     --log-interval 1
-    --eval-iters 0
-    --eval-interval 1000
     --disable-bias-linear
     --optimizer adam
     --dataloader-type single
@@ -252,13 +250,8 @@ LEARNING_RATE_ARGS=(
     --lr-warmup-iters $LR_WARMUP
 )
 
-CHECKPOINTING_ARGS=(
-    --save "$CKPT_DIR"
-    --save-interval $CHECKPOINT_STEPS
-    --ckpt-format torch_dist
-    --load "$CKPT_DIR"
-    --trigger-path "$TRIGGER_DIR"
-)
+# CHECKPOINTING_ARGS, DATA_ARGS, and EVAL_CONTROL_ARGS are set in the train-vs-
+# eval toggle block below (they differ between a training run and EVAL=true).
 
 MIXED_PRECISION_ARGS=(
     --bf16
@@ -286,18 +279,58 @@ TOKENIZER_ARGS=(
     --padded-vocab-size $PADDED_VOCAB
 )
 
-DATA_ARGS=(
-    --data-path 1.0 "$DATA_PATH_PREFIX"
+################ Train vs held-out eval toggle ################
+# EVAL=true  -> load the trained checkpoint and run held-out eval ONLY (no
+#               training) over the dev .bin, reporting audio_token_loss + the
+#               per-stream/codebook NLL via the Step-1 modality buckets.
+# Preprocess the dev set first, e.g.:
+#   python tools/audio/preprocess_fleurs_hcodec.py --split validation \
+#     --output-prefix /iopsstor/scratch/cscs/$USER/datasets/fleurs_en_us_hcodec/dev ...
+# Then:  EVAL=true MODE=fleurs sbatch submit-flatten-3drope.sh
+# Set EVAL_ITERS so EVAL_ITERS*GBS covers the dev docs (= ceil(num_dev_docs/GBS))
+# for an unbiased pass; AudioTextGPTDataset cycles docs if you over/under-shoot.
+EVAL="${EVAL:-false}"
+VALID_DATA_PATH_PREFIX="${VALID_PREFIX:-/iopsstor/scratch/cscs/$USER/datasets/fleurs_en_us_hcodec/dev}"
+EVAL_ITERS="${EVAL_ITERS:-100}"
+
+AUDIO_DATA_ARGS=(
     --multi-codebook-data
     --audio-pattern flatten
     --audio-start-id $AUDIO_START_ID
     --audio-end-id $AUDIO_END_ID
     --audio-vocab-base $AUDIO_VOCAB_BASE
-    --split 100,0,0
     --seq-length $SEQ_LEN
     --num-workers 1
     --num-dataset-builder-threads 1
 )
+
+if [[ "$EVAL" == "true" ]]; then
+    echo "EVAL mode: held-out eval of $CKPT_DIR on $VALID_DATA_PATH_PREFIX ($EVAL_ITERS iters)"
+    # --skip-train skips the training loop; the final do_valid eval still runs.
+    # AudioTextGPTDataset ignores --split, so the dev set must be a SEPARATE
+    # --valid-data-path (not a split of train) to be genuinely held out.
+    DATA_ARGS=(
+        --train-data-path 1.0 "$DATA_PATH_PREFIX"
+        --valid-data-path 1.0 "$VALID_DATA_PATH_PREFIX"
+        "${AUDIO_DATA_ARGS[@]}"
+    )
+    EVAL_CONTROL_ARGS=( --skip-train --eval-iters $EVAL_ITERS --eval-interval 1000 )
+    CHECKPOINTING_ARGS=( --load "$CKPT_DIR" --ckpt-format torch_dist )   # load only, no --save
+else
+    DATA_ARGS=(
+        --data-path 1.0 "$DATA_PATH_PREFIX"
+        --split 100,0,0
+        "${AUDIO_DATA_ARGS[@]}"
+    )
+    EVAL_CONTROL_ARGS=( --eval-iters 0 --eval-interval 1000 )
+    CHECKPOINTING_ARGS=(
+        --save "$CKPT_DIR"
+        --save-interval $CHECKPOINT_STEPS
+        --ckpt-format torch_dist
+        --load "$CKPT_DIR"
+        --trigger-path "$TRIGGER_DIR"
+    )
+fi
 
 
 ################ Compose the command ################
@@ -313,6 +346,7 @@ TRAINING_CMD="python3 $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${LOGGING_ARGS[@]} \
     ${REGULARIZATION_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
+    ${EVAL_CONTROL_ARGS[@]} \
     ${INITIALIZATION_ARGS[@]} \
     ${LEARNING_RATE_ARGS[@]} \
     ${CHECKPOINTING_ARGS[@]} \

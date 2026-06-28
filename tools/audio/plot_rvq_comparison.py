@@ -125,8 +125,6 @@ def _plot_training(delay_tr, flat_tr, out_path, baseline):
     if delay_tr and "audio_mean" in delay_tr:
         ax.plot(delay_tr["iter"], delay_tr["audio_mean"], lw=2, color="tab:red",
                 label="delay — audio loss mean")
-    ax.axhline(baseline, ls="--", color="gray",
-               label=f"random baseline ln(1024) = {baseline:.2f}")
     ax.set_ylabel("audio NLL (nats/token)")
     ax.set_title("Training audio NLL — flatten + 3D-RoPE vs delay (FLEURS en_us)")
     ax.legend(loc="upper right")
@@ -139,7 +137,6 @@ def _plot_training(delay_tr, flat_tr, out_path, baseline):
             if k in delay_tr:
                 ax_cb.plot(delay_tr["iter"], delay_tr[k], lw=1.5, color=c,
                            label=f"delay {k}")
-        ax_cb.axhline(baseline, ls="--", color="gray")
         ax_cb.legend(loc="upper right", ncol=2, title="delay per-codebook")
     else:
         ax_cb.text(0.5, 0.5, "no per-codebook training fields", ha="center",
@@ -168,13 +165,11 @@ def _plot_heldout(delay_ev, flat_ev, out_path, baseline):
     if delay_ev.get("audio") is not None:
         names.append("delay"); vals.append(delay_ev["audio"]); colors.append("tab:red")
     bars = ax_all.bar(names, vals, color=colors)
-    ax_all.axhline(baseline, ls="--", color="gray", label=f"random {baseline:.2f}")
     for b, v in zip(bars, vals):
         ax_all.text(b.get_x() + b.get_width() / 2, v + 0.1, f"{v:.3f}",
                     ha="center", va="bottom", fontsize=10)
     ax_all.set_ylabel("held-out audio NLL (nats/token)")
     ax_all.set_title("Overall")
-    ax_all.legend(loc="upper left")
     ax_all.grid(True, axis="y", alpha=0.3)
 
     # Panel B: per-codebook held-out (flatten 8 stream/codebook + delay 4)
@@ -192,7 +187,6 @@ def _plot_heldout(delay_ev, flat_ev, out_path, baseline):
         if d is not None:
             labels.append(f"delay {k}"); vals2.append(d); colors2.append("tab:red")
     bars2 = ax_cb.bar(range(len(vals2)), vals2, color=colors2)
-    ax_cb.axhline(baseline, ls="--", color="gray", label=f"random {baseline:.2f}")
     for b, v in zip(bars2, vals2):
         ax_cb.text(b.get_x() + b.get_width() / 2, v + 0.1, f"{v:.2f}",
                    ha="center", va="bottom", fontsize=8)
@@ -200,7 +194,6 @@ def _plot_heldout(delay_ev, flat_ev, out_path, baseline):
     ax_cb.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
     ax_cb.set_ylabel("held-out NLL (nats/token)")
     ax_cb.set_title("Per stream / codebook (flatten)  vs  per codebook (delay)")
-    ax_cb.legend(loc="upper left")
     ax_cb.grid(True, axis="y", alpha=0.3)
 
     fig.suptitle("Held-out audio NLL — flatten + 3D-RoPE vs delay (FLEURS en_us, 500 iters)")

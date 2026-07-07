@@ -106,7 +106,8 @@ elif [[ "$MODE" == "fleurs" ]]; then
     LR_WARMUP=20
 
     # FLEURS .bin/.idx prefix written by tools/audio/preprocess_fleurs_hcodec.py
-    DATA_PATH_PREFIX="/iopsstor/scratch/cscs/$USER/datasets/fleurs_en_us_hcodec/train"
+    # Override with TRAIN_PREFIX=... to retrain on a disjoint split (e.g. train_580).
+    DATA_PATH_PREFIX="${TRAIN_PREFIX:-/iopsstor/scratch/cscs/$USER/datasets/fleurs_en_us_hcodec/train}"
 
     EXP_NAME="llama3-8b-fleurs-${NNODES}n-tp${TP_SIZE}-pp${PP_SIZE}-cp${CP_SIZE}"
 fi
@@ -289,16 +290,57 @@ fi
 
 
 ################ Train vs held-out eval toggle ################
-# EVAL=true (MODE=fleurs) -> load the trained delay checkpoint and run held-out
-# eval ONLY (--skip-train) over the dev .bin, reporting 'audio loss mean' + the
-# per-codebook k0..k3 NLL. Preprocess the dev set first (same format as train),
-# then:  EVAL=true MODE=fleurs sbatch submit-multi-codebook.sh
-# Set EVAL_ITERS so EVAL_ITERS*GBS covers the dev docs.
+# HOLDOUT=true (MODE=fleurs) -> FROZEN-FORWARD held-out NLL (the trustworthy
+# metric). Load the trained delay checkpoint (--finetune resets the step counter
+# to 0) and run HOLDOUT_ITERS iters of "training" over the dev .bin at lr 0
+# (weights frozen), reading the per-iter training-path 'audio loss mean'. Uses
+# the consistent training forward path, sidestepping the --skip-train eval bug.
+# EVAL=true (MODE=fleurs) -> load the checkpoint and run --skip-train eval over
+# the dev .bin ('audio loss mean' + per-codebook k0..k3). NOTE: this delay eval
+# path is buggy (reports ~8.5 on train data); prefer HOLDOUT for comparisons.
+# Preprocess the dev set to its OWN prefix first (see --skip-samples), then:
+#   HOLDOUT=true HOLDOUT_ITERS=17 VALID_PREFIX=.../dev_67 MODE=fleurs sbatch submit-multi-codebook.sh
+# Size HOLDOUT_ITERS/EVAL_ITERS so ITERS*GBS ~= num_dev_docs (ceil) for one pass.
+HOLDOUT="${HOLDOUT:-false}"
 EVAL="${EVAL:-false}"
 VALID_DATA_PATH_PREFIX="${VALID_PREFIX:-/iopsstor/scratch/cscs/$USER/datasets/fleurs_en_us_hcodec/dev}"
 EVAL_ITERS="${EVAL_ITERS:-100}"
+HOLDOUT_ITERS="${HOLDOUT_ITERS:-20}"
 EVAL_CONTROL_ARGS=()
-if [[ "$EVAL" == "true" ]]; then
+if [[ "$HOLDOUT" == "true" ]]; then
+    if [[ "$MODE" != "fleurs" ]]; then
+        echo "ERROR: HOLDOUT=true requires MODE=fleurs (needs the real dev .bin)" >&2
+        exit 1
+    fi
+    echo "HOLDOUT mode: frozen-forward held-out NLL of $CKPT_DIR on $VALID_DATA_PATH_PREFIX ($HOLDOUT_ITERS iters, lr 0)"
+    # Feed dev through the TRAINING loader; --finetune loads weights + resets the
+    # step counter so --train-iters actually runs; lr 0 freezes the weights so
+    # every logged 'audio loss mean' is an independent held-out measurement.
+    DATA_ARGS=(
+        --data-path 1.0 "$VALID_DATA_PATH_PREFIX"
+        --multi-codebook-data
+        --audio-start-id $AUDIO_START_ID
+        --audio-end-id $AUDIO_END_ID
+        --split 100,0,0
+        --seq-length $SEQ_LEN
+        --num-workers 1
+        --num-dataset-builder-threads 1
+    )
+    # Reassigned here (arg arrays are expanded into the command below the toggle).
+    TRAINING_ARGS=(
+        --micro-batch-size $MBS
+        --global-batch-size $GBS
+        --train-iters $HOLDOUT_ITERS
+        --log-interval 1
+        --eval-iters 0
+        --eval-interval 100000
+        --disable-bias-linear
+        --optimizer adam
+        --dataloader-type single
+    )
+    LEARNING_RATE_ARGS=( --lr 0 --min-lr 0 --lr-decay-style constant --lr-warmup-iters 0 )
+    CHECKPOINTING_ARGS=( --load "$CKPT_DIR" --finetune --ckpt-format torch_dist )   # load weights, reset step, no --save
+elif [[ "$EVAL" == "true" ]]; then
     if [[ "$MODE" != "fleurs" ]]; then
         echo "ERROR: EVAL=true requires MODE=fleurs (needs the real dev .bin)" >&2
         exit 1

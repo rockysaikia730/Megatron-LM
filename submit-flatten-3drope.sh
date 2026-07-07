@@ -102,7 +102,8 @@ fi
 TRAINING_STEPS="${TRAIN_ITERS:-$TRAINING_STEPS}"
 
 # FLEURS .bin/.idx prefix from tools/audio/preprocess_fleurs_hcodec.py (both modes).
-DATA_PATH_PREFIX="/iopsstor/scratch/cscs/$USER/datasets/fleurs_en_us_hcodec/train"
+# Override with TRAIN_PREFIX=... to retrain on a disjoint split (e.g. train_580).
+DATA_PATH_PREFIX="${TRAIN_PREFIX:-/iopsstor/scratch/cscs/$USER/datasets/fleurs_en_us_hcodec/train}"
 
 # Padded union vocab: round UNION_TOP up to a multiple of (128 * TP) so the
 # output layer shards cleanly across TP. Passed explicitly so the model embedding
@@ -260,18 +261,26 @@ TOKENIZER_ARGS=(
 )
 
 ################ Train vs held-out eval toggle ################
-# EVAL=true  -> load the trained checkpoint and run held-out eval ONLY (no
-#               training) over the dev .bin, reporting audio_token_loss + the
-#               per-stream/codebook NLL via the Step-1 modality buckets.
-# Preprocess the dev set first, e.g.:
-#   python tools/audio/preprocess_fleurs_hcodec.py --split validation \
-#     --output-prefix /iopsstor/scratch/cscs/$USER/datasets/fleurs_en_us_hcodec/dev ...
-# Then:  EVAL=true MODE=fleurs sbatch submit-flatten-3drope.sh
-# Set EVAL_ITERS so EVAL_ITERS*GBS covers the dev docs (= ceil(num_dev_docs/GBS))
-# for an unbiased pass; AudioTextGPTDataset cycles docs if you over/under-shoot.
+# HOLDOUT=true -> FROZEN-FORWARD held-out NLL (the trustworthy metric). Load the
+#               trained checkpoint (--finetune resets the step counter to 0) and
+#               run HOLDOUT_ITERS iters of "training" over the dev .bin at lr 0
+#               (weights frozen), reading the per-iter training-path loss
+#               (audio_token_loss). Uses the consistent training forward path,
+#               sidestepping the delay --skip-train eval bug. No --save.
+# EVAL=true   -> load the checkpoint and run --skip-train eval over the dev .bin
+#               (kept for reference; the delay variant of this path is buggy).
+# Preprocess the dev set to its OWN prefix first (see --skip-samples), e.g.:
+#   python tools/audio/preprocess_fleurs_hcodec.py --skip-samples 580 \
+#     --output-prefix /iopsstor/scratch/cscs/$USER/datasets/fleurs_en_us_hcodec/dev_67 ...
+# Then, for the held-out comparison:
+#   HOLDOUT=true HOLDOUT_ITERS=17 VALID_PREFIX=.../dev_67 MODE=fleurs sbatch submit-flatten-3drope.sh
+# Size HOLDOUT_ITERS/EVAL_ITERS so ITERS*GBS ~= num_dev_docs (ceil) for one pass;
+# AudioTextGPTDataset cycles docs if you over/under-shoot (harmless -- all held out).
+HOLDOUT="${HOLDOUT:-false}"
 EVAL="${EVAL:-false}"
 VALID_DATA_PATH_PREFIX="${VALID_PREFIX:-/iopsstor/scratch/cscs/$USER/datasets/fleurs_en_us_hcodec/dev}"
 EVAL_ITERS="${EVAL_ITERS:-100}"
+HOLDOUT_ITERS="${HOLDOUT_ITERS:-20}"
 
 AUDIO_DATA_ARGS=(
     --multi-codebook-data
@@ -284,7 +293,30 @@ AUDIO_DATA_ARGS=(
     --num-dataset-builder-threads 1
 )
 
-if [[ "$EVAL" == "true" ]]; then
+if [[ "$HOLDOUT" == "true" ]]; then
+    echo "HOLDOUT mode: frozen-forward held-out NLL of $CKPT_DIR on $VALID_DATA_PATH_PREFIX ($HOLDOUT_ITERS iters, lr 0)"
+    # Feed dev through the TRAINING loader; --finetune loads weights + resets the
+    # step counter so --train-iters actually runs; lr 0 freezes the weights so
+    # every logged audio_token_loss is an independent held-out measurement.
+    DATA_ARGS=(
+        --data-path 1.0 "$VALID_DATA_PATH_PREFIX"
+        --split 100,0,0
+        "${AUDIO_DATA_ARGS[@]}"
+    )
+    # Reassigned here (arg arrays are expanded into the command below the toggle).
+    TRAINING_ARGS=(
+        --micro-batch-size $MBS
+        --global-batch-size $GBS
+        --train-iters $HOLDOUT_ITERS
+        --log-interval 1
+        --disable-bias-linear
+        --optimizer adam
+        --dataloader-type single
+    )
+    LEARNING_RATE_ARGS=( --lr 0 --min-lr 0 --lr-decay-style constant --lr-warmup-iters 0 )
+    EVAL_CONTROL_ARGS=( --eval-iters 0 --eval-interval 100000 )
+    CHECKPOINTING_ARGS=( --load "$CKPT_DIR" --finetune --ckpt-format torch_dist )   # load weights, reset step, no --save
+elif [[ "$EVAL" == "true" ]]; then
     echo "EVAL mode: held-out eval of $CKPT_DIR on $VALID_DATA_PATH_PREFIX ($EVAL_ITERS iters)"
     # --skip-train skips the training loop; the final do_valid eval still runs.
     # AudioTextGPTDataset ignores --split, so the dev set must be a SEPARATE

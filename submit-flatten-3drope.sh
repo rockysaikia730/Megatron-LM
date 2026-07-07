@@ -98,6 +98,11 @@ elif [[ "$MODE" == "fleurs" ]]; then
     EXP_NAME="llama3-8b-flat-fleurs-${NNODES}n-tp${TP_SIZE}-pp${PP_SIZE}-cp${CP_SIZE}"
 fi
 
+# Append EXP_TAG to isolate checkpoints per data config (e.g. EXP_TAG=_train580),
+# so a disjoint retrain gets a FRESH checkpoint dir instead of resuming the
+# existing full-data checkpoint. HOLDOUT eval must use the SAME EXP_TAG to load it.
+EXP_NAME="${EXP_NAME}${EXP_TAG:-}"
+
 # Override the step count at submit time:  TRAIN_ITERS=2 MODE=smoke sbatch ...
 TRAINING_STEPS="${TRAIN_ITERS:-$TRAINING_STEPS}"
 
